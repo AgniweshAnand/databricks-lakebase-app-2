@@ -4,7 +4,7 @@ command:
 
 env:
   - name: LAKEBASE_URL
-    valueFrom: "database/lakebase-url"
+    value: "lakebase-url"
   - name: MASSIVE_API_BASE_URL
     value: "https://api.massive.example.com"
   - name: MASSIVE_SECRET_SCOPE
