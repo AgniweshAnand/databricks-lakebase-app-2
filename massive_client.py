@@ -84,6 +84,4 @@ class MassiveClient:
         as the Massive API allows in one request.
         """
         data = self.get(f"/v2/aggs/ticker/{symbol}/prev")
-        if isinstance(data, dict):
-            return data.get("items", [])
-        return data or []
+        return data
