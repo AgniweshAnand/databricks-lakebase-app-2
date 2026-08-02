@@ -119,10 +119,9 @@ def sync_stocks():
 
     client = MassiveClient()
     items = client.get_stocks(symbols[0])  # <-- single API call, no pagination
+    # total = _upsert_batch(items) if items else 0
 
-    total = _upsert_batch(items) if items else 0
-
-    return jsonify({"synced": total, "symbols": symbols})
+    return jsonify({"synced": 0, "symbols": items})
 
 
 def _upsert_batch(items: list[dict]) -> int:
