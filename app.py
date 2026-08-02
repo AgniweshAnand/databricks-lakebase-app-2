@@ -12,7 +12,7 @@ Deploy as a Databricks App using app.yaml.
 import logging
 import os
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, render_template, request
 
 import lakebase
 from massive_client import MassiveClient
@@ -41,6 +41,12 @@ def ensure_table():
 @app.route("/healthz")
 def healthz():
     return jsonify({"status": "ok"})
+
+
+@app.route("/")
+def index():
+    """Simple UI to submit a list of stock symbols to sync from Massive."""
+    return render_template("index.html")
 
 
 @app.route("/records")
@@ -78,6 +84,34 @@ def sync_from_massive():
         total += _upsert_batch(batch)
 
     return jsonify({"synced": total})
+
+
+@app.route("/stocks", methods=["POST"])
+def sync_stocks():
+    """
+    Fetch a specific list of stock symbols from Massive using exactly ONE
+    API call (see MassiveClient.get_stocks), then upsert them into Lakebase.
+    Intended for the UI form so students stay within their API rate limits.
+    """
+    ensure_table()
+
+    if request.is_json:
+        symbols = request.json.get("symbols", [])
+    else:
+        symbols = request.form.get("symbols", "")
+
+    if isinstance(symbols, str):
+        symbols = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+
+    if not symbols:
+        return jsonify({"error": "No symbols provided"}), 400
+
+    client = MassiveClient()
+    items = client.get_stocks(symbols)  # <-- single API call, no pagination
+
+    total = _upsert_batch(items) if items else 0
+
+    return jsonify({"synced": total, "symbols": symbols})
 
 
 def _upsert_batch(items: list[dict]) -> int:

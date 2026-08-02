@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Massive Stock Sync</title>
+  <style>
+    body { font-family: -apple-system, Arial, sans-serif; max-width: 560px; margin: 60px auto; color: #222; }
+    h1 { font-size: 20px; }
+    label { display: block; margin-top: 16px; font-weight: 600; }
+    input[type="text"] { width: 100%; padding: 8px; margin-top: 6px; box-sizing: border-box; }
+    button { margin-top: 16px; padding: 8px 16px; cursor: pointer; }
+    #result { margin-top: 20px; white-space: pre-wrap; background: #f6f6f6; padding: 12px; border-radius: 6px; min-height: 20px; }
+    .hint { color: #777; font-size: 13px; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Sync stocks to Lakebase</h1>
+  <p class="hint">Enter comma-separated ticker symbols. This sends exactly ONE call to the Massive API, so keep the list short.</p>
+
+  <form id="stock-form">
+    <label for="symbols">Ticker symbols</label>
+    <input type="text" id="symbols" name="symbols" placeholder="AAPL, MSFT, GOOG" required>
+    <button type="submit">Sync</button>
+  </form>
+
+  <div id="result"></div>
+
+  <script>
+    const form = document.getElementById("stock-form");
+    const resultEl = document.getElementById("result");
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const symbols = document.getElementById("symbols").value;
+      resultEl.textContent = "Syncing...";
+
+      try {
+        const resp = await fetch("/stocks", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ symbols }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          resultEl.textContent = "Error: " + (data.error || resp.statusText);
+          return;
+        }
+        resultEl.textContent = "Synced " + data.synced + " record(s) for: " + data.symbols.join(", ");
+      } catch (err) {
+        resultEl.textContent = "Request failed: " + err;
+      }
+    });
+  </script>
+</body>
+</html>
