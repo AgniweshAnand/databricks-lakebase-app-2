@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Massive Stock Sync</title>
+  <title>Massive Stock Watchlist</title>
   <style>
     body { font-family: -apple-system, Arial, sans-serif; max-width: 560px; margin: 60px auto; color: #222; }
     h1 { font-size: 20px; }
@@ -11,45 +11,88 @@
     button { margin-top: 16px; padding: 8px 16px; cursor: pointer; }
     #result { margin-top: 20px; white-space: pre-wrap; background: #f6f6f6; padding: 12px; border-radius: 6px; min-height: 20px; }
     .hint { color: #777; font-size: 13px; margin-top: 4px; }
+    table { width: 100%; margin-top: 24px; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #ddd; }
+    th { font-size: 13px; color: #555; text-transform: uppercase; }
   </style>
 </head>
 <body>
-  <h1>Sync stocks to Lakebase</h1>
-  <p class="hint">Enter comma-separated ticker symbols. This sends exactly ONE call to the Massive API, so keep the list short.</p>
+  <h1>Stock Watchlist</h1>
+  <p class="hint">Enter a single ticker symbol. This sends exactly ONE call to the Massive API to fetch the latest price, then adds it to your watchlist.</p>
 
   <form id="stock-form">
-    <label for="symbols">Ticker symbols</label>
-    <input type="text" id="symbols" name="symbols" placeholder="AAPL, MSFT, GOOG" required>
-    <button type="submit">Sync</button>
+    <label for="symbol">Ticker symbol</label>
+    <input type="text" id="symbol" name="symbol" placeholder="AAPL" required>
+    <button type="submit">Add to watchlist</button>
   </form>
 
   <div id="result"></div>
 
+  <table id="watchlist-table">
+    <thead>
+      <tr>
+        <th>Symbol</th>
+        <th>Email</th>
+        <th>Latest price</th>
+        <th>Updated</th>
+      </tr>
+    </thead>
+    <tbody id="watchlist-body"></tbody>
+  </table>
+
   <script>
     const form = document.getElementById("stock-form");
     const resultEl = document.getElementById("result");
+    const watchlistBody = document.getElementById("watchlist-body");
+
+    async function loadWatchlist() {
+      try {
+        const resp = await fetch("/watchlist");
+        const data = await resp.json();
+        if (!resp.ok) {
+          resultEl.textContent = "Error loading watchlist: " + (data.error || resp.statusText);
+          return;
+        }
+        watchlistBody.innerHTML = "";
+        data.forEach((row) => {
+          const tr = document.createElement("tr");
+          const price = row.latest_price !== null && row.latest_price !== undefined
+            ? Number(row.latest_price).toFixed(2)
+            : "-";
+          const updated = row.updated_at ? new Date(row.updated_at).toLocaleString() : "-";
+          tr.innerHTML = `<td>${row.symbol}</td><td>${row.email || "-"}</td><td>${price}</td><td>${updated}</td>`;
+          watchlistBody.appendChild(tr);
+        });
+      } catch (err) {
+        resultEl.textContent = "Failed to load watchlist: " + err;
+      }
+    }
 
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
-      const symbols = document.getElementById("symbols").value;
-      resultEl.textContent = "Syncing...";
+      const symbol = document.getElementById("symbol").value;
+      resultEl.textContent = "Adding to watchlist...";
 
       try {
-        const resp = await fetch("/stocks", {
+        const resp = await fetch("/watchlist", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ symbols }),
+          body: JSON.stringify({ symbol }),
         });
         const data = await resp.json();
         if (!resp.ok) {
           resultEl.textContent = "Error: " + (data.error || resp.statusText);
           return;
         }
-        resultEl.textContent = "Synced " + data.synced + " record(s) for: " + data.symbols.join(", ");
+        resultEl.textContent = "Added " + data.symbol + " at price " + data.latest_price;
+        document.getElementById("symbol").value = "";
+        loadWatchlist();
       } catch (err) {
         resultEl.textContent = "Request failed: " + err;
       }
     });
+
+    loadWatchlist();
   </script>
 </body>
 </html>

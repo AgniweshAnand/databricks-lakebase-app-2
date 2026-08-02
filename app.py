@@ -12,6 +12,7 @@ Deploy as a Databricks App using app.yaml.
 import logging
 import os
 
+from databricks.sdk import WorkspaceClient
 from flask import Flask, jsonify, render_template, request
 
 import lakebase
@@ -21,8 +22,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("massive-app")
 
 app = Flask(__name__)
+_w = WorkspaceClient()
 
 TABLE_NAME = os.environ.get("MASSIVE_TABLE_NAME", "massive_records")
+WATCHLIST_TABLE_NAME = os.environ.get("WATCHLIST_TABLE_NAME", "watchlist")
 
 
 def ensure_table():
@@ -36,6 +39,35 @@ def ensure_table():
         )
         """
     )
+
+
+def ensure_watchlist_table():
+    """Create the watchlist table in Lakebase if it doesn't exist yet."""
+    lakebase.run_write(
+        f"""
+        CREATE TABLE IF NOT EXISTS {WATCHLIST_TABLE_NAME} (
+            symbol TEXT NOT NULL,
+            email TEXT NOT NULL,
+            latest_price NUMERIC,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (symbol, email)
+        )
+        """
+    )
+
+
+def _current_user_email() -> str:
+    """
+    Resolve the current user's email so the watchlist can be personalized.
+
+    Databricks Apps inject the logged-in user's identity via the
+    X-Forwarded-Email header on every request. Fall back to the Databricks
+    SDK's current_user API for local development where that header isn't set.
+    """
+    header_email = request.headers.get("X-Forwarded-Email")
+    if header_email:
+        return header_email
+    return _w.current_user.me().user_name
 
 
 @app.route("/healthz")
@@ -97,31 +129,71 @@ def sync_from_massive():
     return jsonify({"synced": total})
 
 
-@app.route("/stocks", methods=["POST"])
-def sync_stocks():
+@app.route("/watchlist", methods=["GET"])
+def get_watchlist():
+    """Return the current user's watchlist symbols, with their last known price."""
+    ensure_watchlist_table()
+    email = _current_user_email()
+    rows = lakebase.run_query(
+        f"SELECT symbol, email, latest_price, updated_at FROM {WATCHLIST_TABLE_NAME} "
+        f"WHERE email = %s ORDER BY symbol ASC",
+        (email,),
+    )
+    return jsonify(rows)
+
+
+@app.route("/watchlist", methods=["POST"])
+def add_to_watchlist():
     """
-    Fetch a specific list of stock symbols from Massive using exactly ONE
-    API call (see MassiveClient.get_stocks), then upsert them into Lakebase.
-    Intended for the UI form so students stay within their API rate limits.
+    Fetch the latest price for a single stock symbol from Massive using
+    exactly ONE API call (see MassiveClient.get_latest_price), then add/
+    update that symbol on the watchlist in Lakebase.
     """
-    ensure_table()
+    ensure_watchlist_table()
 
     if request.is_json:
-        symbols = request.json.get("symbols", [])
+        symbol = request.json.get("symbol", "")
     else:
-        symbols = request.form.get("symbols", "")
+        symbol = request.form.get("symbol", "")
 
-    if isinstance(symbols, str):
-        symbols = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    symbol = symbol.strip().upper() if isinstance(symbol, str) else ""
 
-    if not symbols:
-        return jsonify({"error": "No symbols provided"}), 400
+    if not symbol:
+        return jsonify({"error": "No symbol provided"}), 400
 
     client = MassiveClient()
-    items = client.get_stocks(symbols[0])  # <-- single API call, no pagination
-    # total = _upsert_batch(items) if items else 0
+    data = client.get_latest_price(symbol)  # <-- single API call, latest price only
+    price = _extract_latest_price(data)
+    email = _current_user_email()
 
-    return jsonify({"synced": 0, "symbols": items})
+    lakebase.run_write(
+        f"""
+        INSERT INTO {WATCHLIST_TABLE_NAME} (symbol, email, latest_price, updated_at)
+        VALUES (%s, %s, %s, now())
+        ON CONFLICT (symbol, email) DO UPDATE
+            SET latest_price = EXCLUDED.latest_price,
+                updated_at = EXCLUDED.updated_at
+        """,
+        (symbol, email, price),
+    )
+
+    return jsonify({"symbol": symbol, "email": email, "latest_price": price})
+
+
+def _extract_latest_price(data: dict) -> float | None:
+    """Pull the trade price out of the Massive 'last trade' response shape.
+
+    Adjust the key lookup here if the real Massive API returns a different
+    field name for the traded price.
+    """
+    if not isinstance(data, dict):
+        return None
+    results = data.get("results", data)
+    if isinstance(results, dict):
+        for key in ("p", "price", "last_price"):
+            if key in results:
+                return results[key]
+    return None
 
 
 def _upsert_batch(items: list[dict]) -> int:

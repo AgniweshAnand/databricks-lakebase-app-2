@@ -75,13 +75,13 @@ class MassiveClient:
             if not cursor:
                 break
 
-    def get_stocks(self, symbol: str) -> list[dict]:
+    def get_latest_price(self, symbol: str) -> dict:
         """
-        Fetch stock data for the given symbols in a SINGLE API call (no
-        pagination). Use this instead of paginated_get() whenever the caller
-        needs to stay within tight API rate limits (e.g. classroom/student
-        accounts), at the cost of only being able to request as many symbols
-        as the Massive API allows in one request.
+        Fetch the latest traded price for a single symbol in a SINGLE API
+        call (no pagination). Use this instead of paginated_get() whenever
+        the caller needs to stay within tight API rate limits (e.g.
+        classroom/student accounts), at the cost of only being able to
+        request one symbol per request.
         """
-        data = self.get(f"/v2/aggs/ticker/{symbol}/prev")
+        data = self.get(f"/v2/last/trade/{symbol}")
         return data
