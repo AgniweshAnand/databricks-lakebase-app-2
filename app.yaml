@@ -1,15 +1,10 @@
-command: [
-  "flask",
-  "--app",
-  "app.py",
-  "run"
-]
+command:
+  - "python"
+  - "app.py"
 
 env:
-  - name: LAKEBASE_SECRET_SCOPE
-    value: "database"
   - name: LAKEBASE_URL
-    value: "lakebase-url"
+    valueFrom: "database/lakebase-url"
   - name: MASSIVE_API_BASE_URL
     value: "https://api.massive.example.com"
   - name: MASSIVE_SECRET_SCOPE
