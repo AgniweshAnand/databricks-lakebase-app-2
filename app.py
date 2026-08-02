@@ -43,6 +43,17 @@ def healthz():
     return jsonify({"status": "ok"})
 
 
+@app.errorhandler(Exception)
+def handle_exception(err):
+    """Ensure all unhandled errors return JSON (not an HTML error page),
+    so the frontend's resp.json() call never chokes on HTML."""
+    logger.exception("Unhandled exception while processing request")
+    status_code = getattr(err, "code", 500)
+    if not isinstance(status_code, int):
+        status_code = 500
+    return jsonify({"error": str(err)}), status_code
+
+
 @app.route("/")
 def index():
     """Simple UI to submit a list of stock symbols to sync from Massive."""
