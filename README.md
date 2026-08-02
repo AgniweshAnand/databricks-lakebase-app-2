@@ -117,6 +117,60 @@ All of this is done through the Databricks workspace UI:
 - `GET /healthz` - health check
 - `GET /records?limit=100` - read synced records from Lakebase
 - `POST /sync?batch_size=500` with optional JSON body `{"path": "/records"}` - pull from Massive API and upsert into Lakebase
+- `GET /watchlist` - get the current user's watchlist symbols with last known price
+- `POST /watchlist` - add/update a symbol on the current user's watchlist
+
+## Enabling Change Data Feed (CDF) for Postgres tables
+
+Lakebase supports **Change Data Feed (CDF)**, a managed way to stream row-level inserts/updates/deletes
+from your Lakebase Postgres tables into Unity Catalog Delta tables (no Debezium, no custom connectors).
+CDF is enabled per-**schema** in the `databricks_postgres` database, and every table in that schema that
+meets two conditions is picked up automatically: it has `REPLICA IDENTITY FULL` set, and it has at least
+one row.
+
+### 1. Set `REPLICA IDENTITY FULL` on the tables you want to track
+
+By default, Postgres only logs primary-key columns on change. To capture full row contents (needed for
+CDF), enable `REPLICA IDENTITY FULL` on each table — including `watchlist` and `massive_records` from
+this app:
+
+```sql
+ALTER TABLE watchlist REPLICA IDENTITY FULL;
+ALTER TABLE massive_records REPLICA IDENTITY FULL;
+```
+
+Run this once per table, either from a Databricks SQL editor connected to your Lakebase instance, or
+from a `psql` session using your `LAKEBASE_URL`. Any new table you add later (e.g. via `ensure_table`-style
+helpers in `app.py`) needs the same `ALTER TABLE ... REPLICA IDENTITY FULL` statement run once before it
+will be included in the feed. Tables with the setting but zero rows are skipped until the first row is
+inserted, then picked up automatically.
+
+You can confirm which tables currently qualify by querying:
+
+```sql
+SELECT * FROM wal2delta.tables;
+```
+
+### 2. Start CDF from the Lakebase UI
+
+1. In your Databricks workspace, open the **Lakebase** tab for your instance.
+2. Go to **Lakebase CDF** and click **Start**.
+3. Select the `databricks_postgres` database and the schema containing your tables (the default
+   schema, `public`, works — it's inside `databricks_postgres`).
+4. Choose the Unity Catalog destination schema/catalog where the CDF history tables should land.
+5. Confirm — the UI shows a preview of qualifying tables (e.g. `watchlist`, `massive_records`) and
+   their sync status before you start.
+
+Once running, each qualifying table gets a corresponding Delta table named `lb_<table_name>_history`
+(e.g. `lb_watchlist_history`) in Unity Catalog, updated roughly every 15 seconds. Each row includes
+metadata columns (`_pg_change_type`, `_pg_lsn`, `_pg_xid`, `_timestamp`, `_sort_by`) describing the
+change, so downstream Delta Live Tables/pipelines can build Silver/Gold layers off the append-only
+history.
+
+> **Note:** Disabling CDF is lossy — changes made while it's off aren't captured, and re-enabling
+> triggers a full resync (every row reloaded as an `insert`). There's no per-table exclusion option
+> within an enabled schema; the only way to keep a table out of the feed is to not set
+> `REPLICA IDENTITY FULL` on it.
 
 ## Notes
 
