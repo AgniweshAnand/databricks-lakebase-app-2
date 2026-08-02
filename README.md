@@ -15,48 +15,102 @@ A minimal Databricks App that:
 - `app.yaml` - Databricks App deployment config (command + env vars)
 - `.env.example` - Local dev env var template (copy to `.env`, do not commit real values)
 
-## Setup
+## Step-by-step setup
 
-1. **Create a Lakebase instance** in your Databricks workspace (Catalog > Lakebase, or via SDK/CLI).
-   In the instance's **Roles & Databases** tab, add a native Postgres role with **Password**
-   authentication (not OAuth) — this gives you a static, non-expiring password. Copy the
-   generated connection string, e.g.:
+### 1. Create a Massive.com account and get an API key
+
+1. Go to [https://massive.com](https://massive.com) and sign up for a new account (or log in if you already have one).
+2. Once logged in, open your account/workspace **Settings** (or **Developer** / **API** section, depending on Massive's current UI).
+3. Find **API Keys** and click **Create API Key** (or **Generate New Key**).
+4. Give the key a name (e.g. `databricks-app`) and copy the generated key value immediately — most providers only show it once.
+5. Keep this key handy for step 3 (Store your secrets) below. Do **not** put it in code, `.env` committed to git, or anywhere else in plaintext.
+
+> If Massive's console differs from the steps above, look for **API Keys**, **Tokens**, or **Credentials** under your account/organization settings — the key is what authenticates requests to `https://api.massive.com` in `massive_client.py`.
+
+### 2. Create a Lakebase instance and a native-password role
+
+1. In your Databricks workspace, go to **Catalog** (left sidebar) and select the **Lakebase** tab (or search "Lakebase" in the workspace search bar).
+2. Click **Create Lakebase instance** (sometimes labeled **Create database instance**).
+   - Give it a name (e.g. `massive-sync-db`).
+   - Choose the capacity/compute size and region appropriate for your workload (defaults are fine to start).
+   - Click **Create** and wait for the instance to reach the **Available**/**Running** state.
+3. Open the newly created instance, then go to the **Roles & Databases** tab (sometimes called **Permissions** or **Roles**).
+4. **Enable native (password) authentication** for the instance if it isn't already on:
+   - Look for an authentication setting such as **Native passwords** or **Password authentication** and toggle/enable it. By default some Lakebase instances only support OAuth/token-based auth — you need password auth enabled so the role below gets a static password instead of a short-lived token.
+5. **Create a new role**:
+   - Click **Add role** / **Create role**.
+   - Choose **Password** as the authentication method (not OAuth).
+   - Name the role (e.g. `massive_app`) and let Databricks generate (or set) a password.
+6. **Copy the connection URL** shown for the role. It will look like:
 
    ```
    postgresql://<role>:<password>@<host>.database.cloud.databricks.com:5432/databricks_postgres?sslmode=require
    ```
 
-2. **Store your secrets** (run once, locally or in a notebook):
+   Keep this URL — you'll paste it into `setup_secrets.py`'s prompt in the next step.
 
-   ```bash
-   python setup_secrets.py
+### 3. Store your secrets
+
+Run once from a **Databricks notebook** in your workspace (no CLI needed):
+
+1. Create a new notebook (or open the Git folder you'll create in step 5, once it's cloned) and attach it to any running cluster.
+2. In a cell, run:
+
+   ```python
+   %sh python setup_secrets.py
    ```
 
-   This prompts for your Massive API key and your Lakebase connection URL via `getpass`
-   (never written to disk or shell history), and stores them as Databricks secrets:
-   `massive/api-key` and `database/lakebase-url`.
+   or open a terminal from the notebook (**Run** > **Open terminal**, if enabled on your cluster) and run `python setup_secrets.py` there.
 
-3. **Configure environment variables** — copy `.env.example` to `.env` for local dev and paste
-   your Lakebase URL as `LAKEBASE_URL`. For deployment, `app.yaml` already pulls `LAKEBASE_URL`
-   from the `database/lakebase-url` secret automatically — no manual editing needed.
+This prompts (via `getpass`, so nothing is echoed or written to disk/shell history) for:
+- Your **Massive API key** (from step 1) → stored as secret `massive/api-key`
+- Your **Lakebase connection URL** (from step 2) → stored as secret `database/lakebase-url`
 
-4. **Install dependencies**:
+### 4. Configure environment variables (local dev)
 
-   ```bash
-   pip install -r requirements.txt
-   ```
+Copy `.env.example` to `.env` and paste your Lakebase URL as `LAKEBASE_URL` for local runs:
 
-5. **Run locally**:
+```bash
+cp .env.example .env
+```
 
-   ```bash
-   python app.py
-   ```
+For deployment, `app.yaml` already pulls `LAKEBASE_URL` from the `database/lakebase-url` secret automatically — no manual editing needed there.
 
-6. **Deploy as a Databricks App**:
+### 5. Install dependencies
 
-   ```bash
-   databricks apps deploy <app-name> --source-code-path .
-   ```
+```bash
+pip install -r requirements.txt
+```
+
+### 6. Run locally
+
+```bash
+python app.py
+```
+
+### 7. Create a Git folder in Databricks and deploy the app (no CLI required)
+
+All of this is done through the Databricks workspace UI:
+
+1. **Create a Git folder**:
+   - In the Databricks workspace sidebar, click **Workspace** > **Create** > **Git folder** (in older UIs this is called **Repos** > **Add Repo**).
+   - Paste the Git URL of this project's repository (e.g. your GitHub/GitLab remote for this codebase).
+   - Choose a folder name and click **Create Git folder**. Databricks will clone the repo directly into your workspace — this becomes the source for your app.
+
+2. **Create the Databricks App**:
+   - In the sidebar, go to **Compute** > **Apps** (or search "Apps" in the workspace search bar).
+   - Click **Create app**, then choose **Custom** (or "From scratch").
+   - Give the app a name (e.g. `massive-lakebase-sync`).
+
+3. **Point the app at your Git folder**:
+   - When prompted for the source code location, select **Workspace files** / **Git folder** and browse to the Git folder you created in step 1 (the folder containing `app.py` and `app.yaml`).
+   - Databricks will read `app.yaml` from that folder automatically to configure the `command` and `env` (including the `LAKEBASE_URL`, `MASSIVE_API_BASE_URL`, and secret scope/key references).
+
+4. **Deploy**:
+   - Click **Deploy** (or **Create and deploy**) in the Apps UI. Databricks will build and start the app using the Git folder's current contents — no `databricks` CLI commands are needed.
+   - Whenever you update the code, pull the latest changes into the Git folder (**Git folder** > **Pull**, via the UI) and click **Deploy** again in the Apps UI to redeploy.
+
+5. Once deployed, open the app's URL from the Apps UI and hit `GET /healthz` to confirm it's running, then try `POST /sync` to pull data from Massive into Lakebase.
 
 ## Endpoints
 

@@ -11,7 +11,9 @@ Deploy as a Databricks App using app.yaml.
 
 import logging
 import os
+import re
 
+import requests
 from databricks.sdk import WorkspaceClient
 from flask import Flask, jsonify, render_template, request
 
@@ -26,6 +28,11 @@ _w = WorkspaceClient()
 
 TABLE_NAME = os.environ.get("MASSIVE_TABLE_NAME", "massive_records")
 WATCHLIST_TABLE_NAME = os.environ.get("WATCHLIST_TABLE_NAME", "watchlist")
+
+# Basic stock ticker shape check: 1-10 uppercase letters, with an optional
+# ".X" or ".XX" share-class suffix (e.g. "BRK.B"). This rejects obviously
+# malformed input before we even call the Massive API.
+_TICKER_RE = re.compile(r"^[A-Z]{1,10}(\.[A-Z]{1,2})?$")
 
 
 def ensure_table():
@@ -158,12 +165,22 @@ def add_to_watchlist():
 
     symbol = symbol.strip().upper() if isinstance(symbol, str) else ""
 
-    if not symbol:
-        return jsonify({"error": "No symbol provided"}), 400
+    if not symbol or not _TICKER_RE.match(symbol):
+        return jsonify({"error": f"Invalid ticker symbol: {symbol!r}"}), 400
 
     client = MassiveClient()
-    data = client.get_latest_price(symbol)  # <-- single API call, latest price only
+    try:
+        data = client.get_latest_price(symbol)  # <-- single API call, latest price only
+    except requests.HTTPError:
+        # Massive returns a 404/4xx for tickers it doesn't recognize.
+        return jsonify({"error": f"Unknown ticker symbol: {symbol}"}), 400
+
     price = _extract_latest_price(data)
+    if price is None:
+        # No usable price in the response (e.g. delisted/invalid ticker
+        # that still 200s with an empty result set) - don't add it.
+        return jsonify({"error": f"No price data available for ticker: {symbol}"}), 400
+
     email = _current_user_email()
 
     lakebase.run_write(
@@ -181,16 +198,29 @@ def add_to_watchlist():
 
 
 def _extract_latest_price(data: dict) -> float | None:
-    """Pull the trade price out of the Massive 'last trade' response shape.
+    """Pull the trade price out of the Massive 'previous close' response shape.
+
+    The /v2/aggs/ticker/{symbol}/prev endpoint returns "results" as a LIST
+    containing a single aggregate bar (not a dict), e.g.:
+        {"status": "OK", "resultsCount": 1, "results": [{"c": 148.845, ...}]}
+    Previously this code treated "results" as a dict, so isinstance(results, dict)
+    was always False for this endpoint's real shape and the price silently
+    resolved to None. Unwrap the list here, and check "status"/"resultsCount"
+    so invalid tickers (empty results) are detected instead of "succeeding"
+    with a null price.
 
     Adjust the key lookup here if the real Massive API returns a different
-    field name for the traded price.
+    field name for the traded/close price.
     """
     if not isinstance(data, dict):
         return None
+    if data.get("status") not in (None, "OK") or data.get("resultsCount") == 0:
+        return None
     results = data.get("results", data)
+    if isinstance(results, list):
+        results = results[0] if results else None
     if isinstance(results, dict):
-        for key in ("p", "price", "last_price"):
+        for key in ("c", "p", "price", "last_price", "vw"):
             if key in results:
                 return results[key]
     return None
