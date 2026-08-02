@@ -7,16 +7,25 @@ pointing at a native Postgres role with a static, non-expiring password.
 This keeps setup to a single secret instead of five separate env vars.
 """
 
+import base64
 import os
 from contextlib import contextmanager
 
 import psycopg2
+from databricks.sdk import WorkspaceClient
 from psycopg2.extras import RealDictCursor
 from sqlalchemy import create_engine
 
+_w = WorkspaceClient()
+
+_SCOPE = os.environ.get("LAKEBASE_SECRET_SCOPE", "database")
+_KEY = os.environ.get("LAKEBASE_SECRET_KEY", "lakebase-url")
+
 
 def _lakebase_url() -> str:
-    return os.environ["LAKEBASE_URL"]
+    """Fetch and decode the Lakebase connection URL from the Databricks secret scope."""
+    secret = _w.secrets.get_secret(scope=_SCOPE, key=_KEY)
+    return base64.b64decode(secret.value).decode("utf-8")
 
 
 @contextmanager
