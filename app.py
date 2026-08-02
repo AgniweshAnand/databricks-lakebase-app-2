@@ -107,6 +107,8 @@ def _upsert_batch(items: list[dict]) -> int:
     return count
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+if __name__ == '__main__':
+    host = os.getenv('FLASK_RUN_HOST', '0.0.0.0')
+    port = int(os.getenv('FLASK_RUN_PORT', 8000))
+    app.run(debug=True, host=host, port=port)
+    print(f"Flask app running on http://{host}:{port}")
