@@ -1,0 +1,19 @@
+command:
+  - "python"
+  - "app.py"
+
+env:
+  - name: LAKEBASE_INSTANCE_NAME
+    value: "massive-lakebase"       # name of your Lakebase (Postgres) instance
+  - name: LAKEBASE_DATABASE
+    value: "databricks_postgres"
+  - name: LAKEBASE_HOST
+    value: "<your-lakebase-host>.database.cloud.databricks.com"
+  - name: LAKEBASE_PORT
+    value: "5432"
+  - name: MASSIVE_API_BASE_URL
+    value: "https://api.massive.example.com"
+  - name: MASSIVE_SECRET_SCOPE
+    value: "massive"
+  - name: MASSIVE_SECRET_KEY
+    value: "api-key"
