@@ -83,5 +83,5 @@ class MassiveClient:
         classroom/student accounts), at the cost of only being able to
         request one symbol per request.
         """
-        data = self.get(f"/v2/last/trade/{symbol}")
+        data = self.get(f"/v2/aggs/ticker/{symbol}/prev")
         return data
