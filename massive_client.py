@@ -83,8 +83,7 @@ class MassiveClient:
         accounts), at the cost of only being able to request as many symbols
         as the Massive API allows in one request.
         """
-        params = {"symbols": ",".join(symbols)}
-        data = self.get("/stocks", params=params)
+        data = self.get(f"/v2/aggs/ticker/{",".join(symbols)}/prev")
         if isinstance(data, dict):
             return data.get("items", [])
         return data or []
