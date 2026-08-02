@@ -75,7 +75,7 @@ class MassiveClient:
             if not cursor:
                 break
 
-    def get_stocks(self, symbols: list[str]) -> list[dict]:
+    def get_stocks(self, symbol: str) -> list[dict]:
         """
         Fetch stock data for the given symbols in a SINGLE API call (no
         pagination). Use this instead of paginated_get() whenever the caller
@@ -83,7 +83,7 @@ class MassiveClient:
         accounts), at the cost of only being able to request as many symbols
         as the Massive API allows in one request.
         """
-        data = self.get(f"/v2/aggs/ticker/{",".join(symbols)}/prev")
+        data = self.get(f"/v2/aggs/ticker/{symbol}/prev")
         if isinstance(data, dict):
             return data.get("items", [])
         return data or []
