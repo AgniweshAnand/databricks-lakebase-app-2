@@ -1,6 +1,9 @@
-command:
-  - "python"
-  - "app.py"
+command: [
+  "flask",
+  "--app",
+  "app.py",
+  "run"
+]
 
 env:
   - name: LAKEBASE_SECRET_SCOPE
