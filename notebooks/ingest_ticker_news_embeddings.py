@@ -30,7 +30,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install -q sentence-transformers pgvector psycopg2-binary trafilatura requests
+# MAGIC %pip install -q sentence-transformers pgvector trafilatura requests
 
 # COMMAND ----------
 
