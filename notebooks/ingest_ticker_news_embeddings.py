@@ -14,6 +14,12 @@
 # MAGIC    Lakebase, using the `pgvector` Postgres extension so downstream RAG /
 # MAGIC    context-engineering exercises can run similarity search directly in
 # MAGIC    Postgres.
+# MAGIC 4. Fetches the full article body for each `article_url` (via
+# MAGIC    `trafilatura`, which strips nav/ads/boilerplate from the raw HTML),
+# MAGIC    splits it into overlapping text chunks, embeds each chunk, and writes
+# MAGIC    them into a `ticker_news_chunk_embeddings` table - so RAG exercises can
+# MAGIC    retrieve fine-grained passages from article bodies, not just
+# MAGIC    title/description.
 # MAGIC
 # MAGIC It re-uses the SAME Lakebase secret (`LAKEBASE_SECRET_SCOPE` /
 # MAGIC `LAKEBASE_SECRET_KEY`) that `lakebase.py` uses in the Flask app, so no
@@ -21,7 +27,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install -q sentence-transformers pgvector psycopg2-binary
+# MAGIC %pip install -q sentence-transformers pgvector psycopg2-binary trafilatura requests
 
 # COMMAND ----------
 
@@ -40,15 +46,21 @@ dbutils.library.restartPython()
 
 dbutils.widgets.text("news_table_name", "ticker_news_documents", "Source table (raw news)")
 dbutils.widgets.text("embeddings_table_name", "ticker_news_embeddings", "Destination table (vectors)")
+dbutils.widgets.text("chunk_embeddings_table_name", "ticker_news_chunk_embeddings", "Destination table (chunk vectors)")
 dbutils.widgets.text("embedding_model", "sentence-transformers/all-MiniLM-L6-v2", "Embedding model")
 dbutils.widgets.text("lakebase_secret_scope", "database", "Lakebase secret scope")
 dbutils.widgets.text("lakebase_secret_key", "lakebase-url", "Lakebase secret key")
+dbutils.widgets.text("chunk_size", "800", "Article content chunk size (chars)")
+dbutils.widgets.text("chunk_overlap", "100", "Article content chunk overlap (chars)")
 
 NEWS_TABLE_NAME = dbutils.widgets.get("news_table_name")
 EMBEDDINGS_TABLE_NAME = dbutils.widgets.get("embeddings_table_name")
+CHUNK_EMBEDDINGS_TABLE_NAME = dbutils.widgets.get("chunk_embeddings_table_name")
 EMBEDDING_MODEL_NAME = dbutils.widgets.get("embedding_model")
 LAKEBASE_SECRET_SCOPE = dbutils.widgets.get("lakebase_secret_scope")
 LAKEBASE_SECRET_KEY = dbutils.widgets.get("lakebase_secret_key")
+CHUNK_SIZE = int(dbutils.widgets.get("chunk_size"))
+CHUNK_OVERLAP = int(dbutils.widgets.get("chunk_overlap"))
 
 # Different sentence-transformers models emit different vector sizes, and the
 # pgvector column type (VECTOR(N)) must match exactly. Rather than hardcoding
@@ -135,6 +147,7 @@ news_df = (
         "ticker",
         "title",
         "description",
+        "article_url",
         "published_utc",
         # Embed on title + description together for richer context.
         "trim(concat(coalesce(title, ''), '. ', coalesce(description, ''))) AS embedding_text",
@@ -298,6 +311,191 @@ print(f"Upserted {upserted} embeddings into {EMBEDDINGS_TABLE_NAME}")
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Fetch and chunk article content
+# MAGIC
+# MAGIC Title/description only gets you so far - the actual article body lives at
+# MAGIC `article_url` on the publisher's site. This step fetches each URL, uses
+# MAGIC `trafilatura` to extract just the article text (stripping nav/ads/related
+# MAGIC links/etc.), and splits it into overlapping chunks so each chunk can be
+# MAGIC embedded and retrieved independently. Fetching is distributed across the
+# MAGIC cluster via `mapInPandas`; any URL that fails to fetch/extract (paywall,
+# MAGIC timeout, dead link) is skipped rather than failing the whole job.
+
+# COMMAND ----------
+
+content_df = news_df.select("id", "ticker", "article_url").filter(
+    "article_url IS NOT NULL AND article_url != ''"
+)
+
+chunks_schema = StructType(
+    [
+        StructField("article_id", StringType(), False),
+        StructField("ticker", StringType(), False),
+        StructField("chunk_index", StringType(), False),
+        StructField("chunk_text", StringType(), False),
+    ]
+)
+
+
+def fetch_and_chunk_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
+    """Runs once per Spark partition/task: fetch each article's HTML, extract
+    the main body text with trafilatura, then split it into overlapping
+    chunks of CHUNK_SIZE characters (CHUNK_OVERLAP characters shared between
+    consecutive chunks so context isn't lost at chunk boundaries)."""
+    import requests
+    import trafilatura
+
+    for batch in iterator:
+        out_article_ids, out_tickers, out_chunk_indexes, out_chunk_texts = [], [], [], []
+        for article_id, ticker, article_url in zip(
+            batch["id"], batch["ticker"], batch["article_url"]
+        ):
+            try:
+                resp = requests.get(article_url, timeout=15)
+                resp.raise_for_status()
+                text = trafilatura.extract(resp.text)
+            except Exception:
+                # Dead link, paywall, timeout, etc. - skip this article's
+                # content chunks rather than failing the whole job.
+                continue
+
+            if not text:
+                continue
+
+            for chunk_index, start in enumerate(range(0, len(text), CHUNK_SIZE - CHUNK_OVERLAP)):
+                chunk_text = text[start : start + CHUNK_SIZE].strip()
+                if not chunk_text:
+                    continue
+                out_article_ids.append(article_id)
+                out_tickers.append(ticker)
+                out_chunk_indexes.append(str(chunk_index))
+                out_chunk_texts.append(chunk_text)
+                if start + CHUNK_SIZE >= len(text):
+                    break
+
+        yield pd.DataFrame(
+            {
+                "article_id": out_article_ids,
+                "ticker": out_tickers,
+                "chunk_index": out_chunk_indexes,
+                "chunk_text": out_chunk_texts,
+            }
+        )
+
+
+chunks_df = content_df.mapInPandas(fetch_and_chunk_partitions, schema=chunks_schema)
+chunks_pdf = chunks_df.toPandas()
+
+print(f"Extracted {len(chunks_pdf)} content chunks from {content_df.count()} article URLs")
+display(chunks_pdf.head(5))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Compute chunk embeddings
+# MAGIC
+# MAGIC Same approach as the title/description embeddings above, but one vector
+# MAGIC per content chunk instead of per article.
+
+# COMMAND ----------
+
+from sentence_transformers import SentenceTransformer
+
+_chunk_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+chunks_pdf["embedding"] = (
+    list(_chunk_model.encode(chunks_pdf["chunk_text"].tolist(), show_progress_bar=False))
+    if len(chunks_pdf)
+    else []
+)
+
+print(f"Computed {len(chunks_pdf)} chunk embeddings using {EMBEDDING_MODEL_NAME}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Ensure the chunk embeddings destination table exists
+
+# COMMAND ----------
+
+with psycopg2.connect(lakebase_url) as conn:
+    with conn.cursor() as cur:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {CHUNK_EMBEDDINGS_TABLE_NAME} (
+                id TEXT PRIMARY KEY,
+                article_id TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                chunk_index INT NOT NULL,
+                chunk_text TEXT NOT NULL,
+                embedding VECTOR({EMBEDDING_DIM}) NOT NULL,
+                model_name TEXT NOT NULL,
+                embedded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        # Approximate-nearest-neighbor index for fast cosine similarity search.
+        cur.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_{CHUNK_EMBEDDINGS_TABLE_NAME}_embedding
+            ON {CHUNK_EMBEDDINGS_TABLE_NAME}
+            USING hnsw (embedding vector_cosine_ops)
+            """
+        )
+    conn.commit()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Upsert chunk embeddings into Lakebase
+
+# COMMAND ----------
+
+chunk_rows = [
+    (
+        f"{row['article_id']}_{row['chunk_index']}",
+        row["article_id"],
+        row["ticker"],
+        int(row["chunk_index"]),
+        row["chunk_text"],
+        _to_pgvector_literal(row["embedding"]),
+        EMBEDDING_MODEL_NAME,
+    )
+    for _, row in chunks_pdf.iterrows()
+]
+
+chunk_upserted = 0
+
+with psycopg2.connect(lakebase_url) as conn:
+    with conn.cursor() as cur:
+        for start in range(0, len(chunk_rows), BATCH_SIZE):
+            batch = chunk_rows[start : start + BATCH_SIZE]
+            execute_values(
+                cur,
+                f"""
+                INSERT INTO {CHUNK_EMBEDDINGS_TABLE_NAME}
+                    (id, article_id, ticker, chunk_index, chunk_text, embedding, model_name, embedded_at)
+                VALUES %s
+                ON CONFLICT (id) DO UPDATE
+                    SET article_id = EXCLUDED.article_id,
+                        ticker = EXCLUDED.ticker,
+                        chunk_index = EXCLUDED.chunk_index,
+                        chunk_text = EXCLUDED.chunk_text,
+                        embedding = EXCLUDED.embedding,
+                        model_name = EXCLUDED.model_name,
+                        embedded_at = EXCLUDED.embedded_at
+                """,
+                batch,
+                template="(%s, %s, %s, %s, %s, %s::vector, %s, now())",
+            )
+            chunk_upserted += len(batch)
+        conn.commit()
+
+print(f"Upserted {chunk_upserted} chunk embeddings into {CHUNK_EMBEDDINGS_TABLE_NAME}")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Sanity check: similarity search
 # MAGIC
 # MAGIC Quick smoke test showing the whole point of this pipeline for the
@@ -326,3 +524,27 @@ with psycopg2.connect(lakebase_url) as conn:
         )
         for ticker, title, distance in cur.fetchall():
             print(f"[{ticker}] {title!r}  (distance={distance:.4f})")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Same query, but against the article-content chunks instead of
+# MAGIC title/description - shows the finer-grained passages a RAG exercise
+# MAGIC would actually retrieve and feed into an LLM prompt.
+
+# COMMAND ----------
+
+with psycopg2.connect(lakebase_url) as conn:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT ticker, chunk_index, chunk_text, embedding <=> %s::vector AS cosine_distance
+            FROM {CHUNK_EMBEDDINGS_TABLE_NAME}
+            ORDER BY cosine_distance ASC
+            LIMIT 5
+            """,
+            (query_vector,),
+        )
+        for ticker, chunk_index, chunk_text, distance in cur.fetchall():
+            preview = chunk_text[:120].replace("\n", " ")
+            print(f"[{ticker}] chunk#{chunk_index} {preview!r}...  (distance={distance:.4f})")

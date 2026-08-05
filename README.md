@@ -14,7 +14,7 @@ A minimal Databricks App that:
 - `setup_secrets.py` - One-time script to create the secret scopes and store the Massive API key + Lakebase URL
 - `app.yaml` - Databricks App deployment config (command + env vars)
 - `templates/index.html` - Watchlist UI (add + remove tickers)
-- `notebooks/ingest_ticker_news_embeddings.py` - Spark notebook: reads `ticker_news_documents`, computes embeddings, writes `ticker_news_embeddings` (pgvector)
+- `notebooks/ingest_ticker_news_embeddings.py` - Spark notebook: reads `ticker_news_documents`, computes title/description embeddings into `ticker_news_embeddings`, and fetches + chunks + embeds each article's full body (via `trafilatura`) into `ticker_news_chunk_embeddings` (pgvector)
 - `databricks.yml` + `resources/ingest_ticker_news_embeddings_job.yml` - Databricks Asset Bundle config that schedules the notebook above as a Workflow (see [Scheduling the embeddings notebook](#scheduling-the-embeddings-notebook-as-a-databricks-workflow))
 - `.env.example` - Local dev env var template (copy to `.env`, do not commit real values)
 
@@ -128,8 +128,10 @@ All of this is done through the Databricks workspace UI:
 ## Scheduling the embeddings notebook as a Databricks Workflow
 
 `notebooks/ingest_ticker_news_embeddings.py` turns the raw rows in `ticker_news_documents`
-(populated by `POST /news/sync`) into vector embeddings in `ticker_news_embeddings`. You can run it
-on a schedule two ways — pick whichever fits your setup:
+(populated by `POST /news/sync`) into vector embeddings in `ticker_news_embeddings` (title +
+description) and `ticker_news_chunk_embeddings` (chunks of the full article body, fetched from
+each article's `article_url` and extracted with `trafilatura`). You can run it on a schedule two
+ways — pick whichever fits your setup:
 
 ### Option A: Databricks Asset Bundle (CLI, version-controlled)
 
@@ -159,9 +161,12 @@ If you'd rather not use the CLI, you can create the equivalent job by hand in th
    - Under **Parameters**, add the same widget values the notebook expects:
      - `news_table_name` = `ticker_news_documents`
      - `embeddings_table_name` = `ticker_news_embeddings`
+     - `chunk_embeddings_table_name` = `ticker_news_chunk_embeddings`
      - `embedding_model` = `sentence-transformers/all-MiniLM-L6-v2`
      - `lakebase_secret_scope` = `database`
      - `lakebase_secret_key` = `lakebase-url`
+     - `chunk_size` = `800`
+     - `chunk_overlap` = `100`
 4. **Add a schedule**: click **Add trigger** on the job, choose **Scheduled**, and set it to run
    daily (e.g. 6:00 AM UTC) using either the simple picker or a cron expression
    (`0 0 6 * * ?`, timezone UTC).
@@ -180,6 +185,9 @@ from your Lakebase Postgres tables into Unity Catalog Delta tables (no Debezium,
 CDF is enabled per-**schema** in the `databricks_postgres` database, and every table in that schema that
 meets two conditions is picked up automatically: it has `REPLICA IDENTITY FULL` set, and it has at least
 one row.
+
+> **Note:** CDF is only available on paid Databricks accounts — it is not supported on the free
+> Databricks Community Edition or trial tier.
 
 ### 1. Set `REPLICA IDENTITY FULL` on the tables you want to track
 
