@@ -44,20 +44,32 @@ dbutils.library.restartPython()
 
 # COMMAND ----------
 
-dbutils.widgets.text("news_table_name", "ticker_news_documents", "Source table (raw news)")
+dbutils.widgets.text("watchlist_table_name", "watchlist", "Source table (watchlist symbols)")
+dbutils.widgets.text("news_table_name", "ticker_news_documents", "Destination table (raw news)")
 dbutils.widgets.text("embeddings_table_name", "ticker_news_embeddings", "Destination table (vectors)")
 dbutils.widgets.text("chunk_embeddings_table_name", "ticker_news_chunk_embeddings", "Destination table (chunk vectors)")
 dbutils.widgets.text("embedding_model", "sentence-transformers/all-MiniLM-L6-v2", "Embedding model")
 dbutils.widgets.text("lakebase_secret_scope", "database", "Lakebase secret scope")
 dbutils.widgets.text("lakebase_secret_key", "lakebase-url", "Lakebase secret key")
+dbutils.widgets.text("massive_secret_scope", "massive", "Massive API secret scope")
+dbutils.widgets.text("massive_secret_key", "api-key", "Massive API secret key")
+dbutils.widgets.text("massive_api_base_url", "https://api.massive.com", "Massive API base URL")
+dbutils.widgets.text("news_fetch_limit", "50", "Max articles to fetch per ticker")
+dbutils.widgets.text("max_requests_per_minute", "5", "Massive API rate limit (free tier is strict)")
 dbutils.widgets.text("chunk_size", "800", "Article content chunk size (chars)")
 dbutils.widgets.text("chunk_overlap", "100", "Article content chunk overlap (chars)")
 
+WATCHLIST_TABLE_NAME = dbutils.widgets.get("watchlist_table_name")
 NEWS_TABLE_NAME = dbutils.widgets.get("news_table_name")
 EMBEDDINGS_TABLE_NAME = dbutils.widgets.get("embeddings_table_name")
 CHUNK_EMBEDDINGS_TABLE_NAME = dbutils.widgets.get("chunk_embeddings_table_name")
 EMBEDDING_MODEL_NAME = dbutils.widgets.get("embedding_model")
 LAKEBASE_SECRET_SCOPE = dbutils.widgets.get("lakebase_secret_scope")
+MASSIVE_SECRET_SCOPE = dbutils.widgets.get("massive_secret_scope")
+MASSIVE_SECRET_KEY = dbutils.widgets.get("massive_secret_key")
+MASSIVE_API_BASE_URL = dbutils.widgets.get("massive_api_base_url")
+NEWS_FETCH_LIMIT = int(dbutils.widgets.get("news_fetch_limit"))
+MAX_REQUESTS_PER_MINUTE = int(dbutils.widgets.get("max_requests_per_minute"))
 LAKEBASE_SECRET_KEY = dbutils.widgets.get("lakebase_secret_key")
 CHUNK_SIZE = int(dbutils.widgets.get("chunk_size"))
 CHUNK_OVERLAP = int(dbutils.widgets.get("chunk_overlap"))
@@ -129,6 +141,174 @@ jdbc_properties = {
     "driver": "org.postgresql.Driver",
     "sslmode": "require",
 }
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Fetch news from Massive for watchlisted tickers
+# MAGIC
+# MAGIC This ETL is now self-contained: instead of relying on the Flask app's
+# MAGIC `POST /news/sync` route to have populated `ticker_news_documents` ahead of
+# MAGIC time, the notebook queries the `watchlist` table in Lakebase directly to
+# MAGIC find out which tickers are being tracked, then pulls news for exactly
+# MAGIC those tickers from Massive itself.
+# MAGIC
+# MAGIC The free Massive API tier is rate-limited very aggressively, so requests
+# MAGIC are made **serially** (not distributed across Spark workers) with a sleep
+# MAGIC between calls that enforces `MAX_REQUESTS_PER_MINUTE` (default 5/min).
+
+# COMMAND ----------
+
+import base64 as _b64
+import time
+
+import psycopg2
+import requests
+
+
+def get_massive_api_key() -> str:
+    secret = w.secrets.get_secret(scope=MASSIVE_SECRET_SCOPE, key=MASSIVE_SECRET_KEY)
+    return _b64.b64decode(secret.value).decode("utf-8")
+
+
+def get_watchlist_tickers() -> list[str]:
+    """Distinct, uppercased ticker symbols currently tracked across all users
+    in the watchlist table - these are the only tickers we fetch news for."""
+    with psycopg2.connect(lakebase_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT DISTINCT symbol FROM {WATCHLIST_TABLE_NAME}")
+            return [row[0].strip().upper() for row in cur.fetchall() if row[0]]
+
+
+def fetch_news_for_ticker(session: requests.Session, ticker: str, limit: int) -> list[dict]:
+    """Single GET /v2/reference/news call for one ticker (mirrors
+    MassiveClient.get_news in massive_client.py)."""
+    resp = session.get(
+        f"{MASSIVE_API_BASE_URL}/v2/reference/news",
+        params={"ticker": ticker, "limit": limit, "order": "desc", "sort": "published_utc"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json().get("results", [])
+
+
+def ensure_news_table():
+    """Same schema as ensure_news_table() in app.py, kept in sync so either
+    the Flask app's POST /news/sync or this notebook can populate the table."""
+    with psycopg2.connect(lakebase_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {NEWS_TABLE_NAME} (
+                    id TEXT PRIMARY KEY,
+                    ticker TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    author TEXT,
+                    article_url TEXT,
+                    publisher_name TEXT,
+                    keywords JSONB,
+                    sentiment TEXT,
+                    sentiment_reasoning TEXT,
+                    published_utc TIMESTAMPTZ,
+                    payload JSONB NOT NULL,
+                    synced_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            cur.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{NEWS_TABLE_NAME}_ticker "
+                f"ON {NEWS_TABLE_NAME} (ticker)"
+            )
+        conn.commit()
+
+
+def upsert_news_batch(ticker: str, articles: list[dict]) -> int:
+    """Same upsert logic as _upsert_news_batch() in app.py."""
+    import json as _json
+
+    count = 0
+    with psycopg2.connect(lakebase_url) as conn:
+        with conn.cursor() as cur:
+            for article in articles:
+                sentiment = None
+                sentiment_reasoning = None
+                for insight in article.get("insights", []) or []:
+                    if insight.get("ticker") == ticker:
+                        sentiment = insight.get("sentiment")
+                        sentiment_reasoning = insight.get("sentiment_reasoning")
+                        break
+
+                publisher = article.get("publisher") or {}
+                cur.execute(
+                    f"""
+                    INSERT INTO {NEWS_TABLE_NAME} (
+                        id, ticker, title, description, author, article_url,
+                        publisher_name, keywords, sentiment, sentiment_reasoning,
+                        published_utc, payload, synced_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                    ON CONFLICT (id) DO UPDATE
+                        SET ticker = EXCLUDED.ticker,
+                            title = EXCLUDED.title,
+                            description = EXCLUDED.description,
+                            author = EXCLUDED.author,
+                            article_url = EXCLUDED.article_url,
+                            publisher_name = EXCLUDED.publisher_name,
+                            keywords = EXCLUDED.keywords,
+                            sentiment = EXCLUDED.sentiment,
+                            sentiment_reasoning = EXCLUDED.sentiment_reasoning,
+                            published_utc = EXCLUDED.published_utc,
+                            payload = EXCLUDED.payload,
+                            synced_at = EXCLUDED.synced_at
+                    """,
+                    (
+                        str(article.get("id")),
+                        ticker,
+                        article.get("title", ""),
+                        article.get("description"),
+                        article.get("author"),
+                        article.get("article_url"),
+                        publisher.get("name"),
+                        _json.dumps(article.get("keywords", [])),
+                        sentiment,
+                        sentiment_reasoning,
+                        article.get("published_utc"),
+                        _json.dumps(article),
+                    ),
+                )
+                count += 1
+            conn.commit()
+    return count
+
+
+ensure_news_table()
+
+tickers = get_watchlist_tickers()
+print(f"Found {len(tickers)} distinct watchlisted tickers: {tickers}")
+
+# Enforce MAX_REQUESTS_PER_MINUTE by spacing calls evenly across a minute -
+# e.g. 5/min -> one request every 12s. Sleeping BEFORE each call after the
+# first keeps this correct even if a single request itself takes a while.
+_seconds_between_requests = 60.0 / MAX_REQUESTS_PER_MINUTE
+
+_massive_session = requests.Session()
+_massive_session.headers.update(
+    {"Authorization": f"Bearer {get_massive_api_key()}", "Content-Type": "application/json"}
+)
+
+news_synced = 0
+for i, ticker in enumerate(tickers):
+    if i > 0:
+        time.sleep(_seconds_between_requests)
+    try:
+        articles = fetch_news_for_ticker(_massive_session, ticker, NEWS_FETCH_LIMIT)
+    except Exception as exc:
+        print(f"Skipping {ticker}: failed to fetch news ({exc})")
+        continue
+    news_synced += upsert_news_batch(ticker, articles)
+
+print(f"Synced {news_synced} news articles into {NEWS_TABLE_NAME} for {len(tickers)} tickers")
 
 # COMMAND ----------
 

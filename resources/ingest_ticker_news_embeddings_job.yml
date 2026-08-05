@@ -1,6 +1,8 @@
 # Databricks Workflow that runs notebooks/ingest_ticker_news_embeddings.py on
-# a schedule, turning the raw news documents synced via POST /news/sync into
-# vector embeddings for the context-engineering course's RAG exercises.
+# a schedule. The notebook itself queries the `watchlist` table for tickers,
+# fetches news for those tickers directly from Massive (rate-limited to
+# max_requests_per_minute), and turns the resulting documents into vector
+# embeddings for the context-engineering course's RAG exercises.
 #
 # Deploy: databricks bundle deploy -t dev
 # Run once manually: databricks bundle run ingest_ticker_news_embeddings_job -t dev
@@ -37,11 +39,17 @@ resources:
           notebook_task:
             notebook_path: ../notebooks/ingest_ticker_news_embeddings.py
             base_parameters:
+              watchlist_table_name: "watchlist"
               news_table_name: "ticker_news_documents"
               embeddings_table_name: "ticker_news_embeddings"
               chunk_embeddings_table_name: "ticker_news_chunk_embeddings"
               embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
               lakebase_secret_scope: "database"
               lakebase_secret_key: "lakebase-url"
+              massive_secret_scope: "massive"
+              massive_secret_key: "api-key"
+              massive_api_base_url: "https://api.massive.com"
+              news_fetch_limit: "50"
+              max_requests_per_minute: "5"
               chunk_size: "800"
               chunk_overlap: "100"
