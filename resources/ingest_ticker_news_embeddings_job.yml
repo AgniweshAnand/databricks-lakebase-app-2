@@ -1,0 +1,44 @@
+# Databricks Workflow that runs notebooks/ingest_ticker_news_embeddings.py on
+# a schedule, turning the raw news documents synced via POST /news/sync into
+# vector embeddings for the context-engineering course's RAG exercises.
+#
+# Deploy: databricks bundle deploy -t dev
+# Run once manually: databricks bundle run ingest_ticker_news_embeddings_job -t dev
+
+resources:
+  jobs:
+    ingest_ticker_news_embeddings_job:
+      name: "[${bundle.target}] Ingest Ticker News Embeddings"
+
+      # Runs daily at 6:00 AM UTC, after Massive news feeds have typically
+      # updated overnight. Adjust to match your class schedule.
+      schedule:
+        quartz_cron_expression: "0 0 6 * * ?"
+        timezone_id: "UTC"
+        pause_status: PAUSED  # flip to UNPAUSED once you've validated a manual run
+
+      email_notifications:
+        on_failure:
+          - ${workspace.current_user.userName}
+
+      max_concurrent_runs: 1
+
+      job_clusters:
+        - job_cluster_key: default_cluster
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "i3.xlarge"
+            num_workers: 2
+            data_security_mode: SINGLE_USER
+
+      tasks:
+        - task_key: ingest_ticker_news_embeddings
+          job_cluster_key: default_cluster
+          notebook_task:
+            notebook_path: ../notebooks/ingest_ticker_news_embeddings.py
+            base_parameters:
+              news_table_name: "ticker_news_documents"
+              embeddings_table_name: "ticker_news_embeddings"
+              embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+              lakebase_secret_scope: "database"
+              lakebase_secret_key: "lakebase-url"

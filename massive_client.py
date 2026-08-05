@@ -85,3 +85,31 @@ class MassiveClient:
         """
         data = self.get(f"/v2/aggs/ticker/{symbol}/prev")
         return data
+
+    def get_news(
+        self,
+        ticker: str,
+        limit: int = 50,
+        published_utc_gte: str | None = None,
+    ) -> list[dict]:
+        """
+        Fetch recent news articles for a single ticker in a SINGLE API call
+        (GET /v2/reference/news). Returns just the "results" list - each
+        item has: id, title, description, author, article_url, publisher,
+        tickers, keywords, insights (sentiment), published_utc.
+
+        published_utc_gte: optional ISO date/datetime string to only fetch
+        articles published on/after this date (maps to the API's
+        "published_utc.gte" filter).
+        """
+        params: dict[str, Any] = {
+            "ticker": ticker,
+            "limit": limit,
+            "order": "desc",
+            "sort": "published_utc",
+        }
+        if published_utc_gte:
+            params["published_utc.gte"] = published_utc_gte
+
+        data = self.get("/v2/reference/news", params=params)
+        return data.get("results", [])

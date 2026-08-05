@@ -1,0 +1,328 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Ingest Ticker News -> Vector Embeddings (Lakebase)
+# MAGIC
+# MAGIC This notebook is part of the **Context Engineering on Databricks** course.
+# MAGIC
+# MAGIC It:
+# MAGIC 1. Reads raw news documents from the `ticker_news_documents` table in
+# MAGIC    Lakebase (populated by `POST /news/sync` in the Flask app, which pulls
+# MAGIC    from the Massive `/v2/reference/news` endpoint - see `massive_client.py`).
+# MAGIC 2. Computes a sentence embedding for each article (title + description)
+# MAGIC    using Spark, distributed across the cluster via a pandas UDF.
+# MAGIC 3. Writes the embeddings into a `ticker_news_embeddings` table in
+# MAGIC    Lakebase, using the `pgvector` Postgres extension so downstream RAG /
+# MAGIC    context-engineering exercises can run similarity search directly in
+# MAGIC    Postgres.
+# MAGIC
+# MAGIC It re-uses the SAME Lakebase secret (`LAKEBASE_SECRET_SCOPE` /
+# MAGIC `LAKEBASE_SECRET_KEY`) that `lakebase.py` uses in the Flask app, so no
+# MAGIC extra secrets need to be created for this notebook.
+
+# COMMAND ----------
+
+# MAGIC %pip install -q sentence-transformers pgvector psycopg2-binary
+
+# COMMAND ----------
+
+dbutils.library.restartPython()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Config
+# MAGIC
+# MAGIC Widgets let you override the source/destination table names and the
+# MAGIC embedding model without editing the notebook - useful when running this
+# MAGIC as a scheduled Databricks Job.
+
+# COMMAND ----------
+
+dbutils.widgets.text("news_table_name", "ticker_news_documents", "Source table (raw news)")
+dbutils.widgets.text("embeddings_table_name", "ticker_news_embeddings", "Destination table (vectors)")
+dbutils.widgets.text("embedding_model", "sentence-transformers/all-MiniLM-L6-v2", "Embedding model")
+dbutils.widgets.text("lakebase_secret_scope", "database", "Lakebase secret scope")
+dbutils.widgets.text("lakebase_secret_key", "lakebase-url", "Lakebase secret key")
+
+NEWS_TABLE_NAME = dbutils.widgets.get("news_table_name")
+EMBEDDINGS_TABLE_NAME = dbutils.widgets.get("embeddings_table_name")
+EMBEDDING_MODEL_NAME = dbutils.widgets.get("embedding_model")
+LAKEBASE_SECRET_SCOPE = dbutils.widgets.get("lakebase_secret_scope")
+LAKEBASE_SECRET_KEY = dbutils.widgets.get("lakebase_secret_key")
+
+# Different sentence-transformers models emit different vector sizes, and the
+# pgvector column type (VECTOR(N)) must match exactly. Rather than hardcoding
+# one dimension, switch on the model name so swapping EMBEDDING_MODEL_NAME via
+# the widget above automatically resizes the destination table's vector column.
+match EMBEDDING_MODEL_NAME:
+    case "sentence-transformers/all-MiniLM-L6-v2":
+        EMBEDDING_DIM = 384
+    case "sentence-transformers/all-MiniLM-L12-v2":
+        EMBEDDING_DIM = 384
+    case "sentence-transformers/all-mpnet-base-v2":
+        EMBEDDING_DIM = 768
+    case "sentence-transformers/paraphrase-multilingual-mpnet-base-v2":
+        EMBEDDING_DIM = 768
+    case "BAAI/bge-small-en-v1.5":
+        EMBEDDING_DIM = 384
+    case "BAAI/bge-base-en-v1.5":
+        EMBEDDING_DIM = 768
+    case "BAAI/bge-large-en-v1.5":
+        EMBEDDING_DIM = 1024
+    case "text-embedding-3-small":
+        EMBEDDING_DIM = 1536
+    case "text-embedding-3-large":
+        EMBEDDING_DIM = 3072
+    case _:
+        raise ValueError(
+            f"Unknown embedding model {EMBEDDING_MODEL_NAME!r} - add its output "
+            "dimension to the match/case block above before running this notebook."
+        )
+
+print(f"Using model {EMBEDDING_MODEL_NAME!r} -> {EMBEDDING_DIM}-dim vectors")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Resolve the Lakebase connection URL
+# MAGIC
+# MAGIC Same secret, same decoding scheme as `lakebase.py`: a single base64-encoded
+# MAGIC Postgres URL (`postgresql://role:password@host:5432/db?sslmode=require`)
+# MAGIC stored in a Databricks secret scope. We parse it into the pieces Spark's
+# MAGIC JDBC reader needs (url/user/password) and also keep the raw DSN for the
+# MAGIC psycopg2 writer step (pgvector values can't go through the JDBC writer).
+
+# COMMAND ----------
+
+import base64
+from urllib.parse import urlparse
+
+from databricks.sdk import WorkspaceClient
+
+w = WorkspaceClient()
+
+
+def get_lakebase_url() -> str:
+    secret = w.secrets.get_secret(scope=LAKEBASE_SECRET_SCOPE, key=LAKEBASE_SECRET_KEY)
+    return base64.b64decode(secret.value).decode("utf-8")
+
+
+lakebase_url = get_lakebase_url()
+parsed = urlparse(lakebase_url)
+
+jdbc_url = f"jdbc:postgresql://{parsed.hostname}:{parsed.port or 5432}{parsed.path}"
+jdbc_properties = {
+    "user": parsed.username,
+    "password": parsed.password,
+    "driver": "org.postgresql.Driver",
+    "sslmode": "require",
+}
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Load raw news documents with Spark
+# MAGIC
+# MAGIC Reads the whole `ticker_news_documents` table via JDBC into a Spark
+# MAGIC DataFrame so embedding computation can be distributed across the cluster.
+
+# COMMAND ----------
+
+news_df = (
+    spark.read.jdbc(url=jdbc_url, table=NEWS_TABLE_NAME, properties=jdbc_properties)
+    .selectExpr(
+        "id",
+        "ticker",
+        "title",
+        "description",
+        "published_utc",
+        # Embed on title + description together for richer context.
+        "trim(concat(coalesce(title, ''), '. ', coalesce(description, ''))) AS embedding_text",
+    )
+    .filter("embedding_text IS NOT NULL AND embedding_text != ''")
+)
+
+print(f"Loaded {news_df.count()} news documents from {NEWS_TABLE_NAME}")
+display(news_df.limit(5))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Compute embeddings (distributed pandas UDF)
+# MAGIC
+# MAGIC Loads the sentence-transformers model once per executor process (not per
+# MAGIC row) and applies it in batches via `mapInPandas`, which scales across
+# MAGIC however many workers the cluster has.
+
+# COMMAND ----------
+
+from typing import Iterator
+
+import pandas as pd
+from pyspark.sql.types import ArrayType, FloatType, StringType, StructField, StructType
+
+embeddings_schema = StructType(
+    [
+        StructField("id", StringType(), False),
+        StructField("ticker", StringType(), False),
+        StructField("title", StringType(), False),
+        StructField("published_utc", StringType(), True),
+        StructField("embedding", ArrayType(FloatType()), False),
+    ]
+)
+
+
+def embed_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
+    """Runs once per Spark partition/task: load the model once, then embed
+    every batch of rows handed to this partition."""
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+    for batch in iterator:
+        vectors = model.encode(batch["embedding_text"].tolist(), show_progress_bar=False)
+        yield pd.DataFrame(
+            {
+                "id": batch["id"],
+                "ticker": batch["ticker"],
+                "title": batch["title"],
+                "published_utc": batch["published_utc"].astype(str),
+                "embedding": [v.tolist() for v in vectors],
+            }
+        )
+
+
+embeddings_df = news_df.mapInPandas(embed_partitions, schema=embeddings_schema)
+embeddings_pdf = embeddings_df.toPandas()
+
+print(f"Computed {len(embeddings_pdf)} embeddings using {EMBEDDING_MODEL_NAME}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Ensure the pgvector destination table exists
+# MAGIC
+# MAGIC `pgvector` isn't a JDBC-native type, so we create the table (and enable
+# MAGIC the extension) with a direct psycopg2 connection rather than Spark's JDBC
+# MAGIC writer, which can't express a `vector(N)` column.
+
+# COMMAND ----------
+
+import psycopg2
+
+with psycopg2.connect(lakebase_url) as conn:
+    with conn.cursor() as cur:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {EMBEDDINGS_TABLE_NAME} (
+                id TEXT PRIMARY KEY,
+                ticker TEXT NOT NULL,
+                title TEXT NOT NULL,
+                published_utc TIMESTAMPTZ,
+                embedding VECTOR({EMBEDDING_DIM}) NOT NULL,
+                model_name TEXT NOT NULL,
+                embedded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        # Approximate-nearest-neighbor index for fast cosine similarity search.
+        cur.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_{EMBEDDINGS_TABLE_NAME}_embedding
+            ON {EMBEDDINGS_TABLE_NAME}
+            USING hnsw (embedding vector_cosine_ops)
+            """
+        )
+    conn.commit()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Upsert embeddings into Lakebase
+# MAGIC
+# MAGIC Written in batches with `psycopg2.extras.execute_values` for throughput.
+# MAGIC Each embedding is cast to Postgres' `vector` type via `::vector`.
+
+# COMMAND ----------
+
+from psycopg2.extras import execute_values
+
+
+def _to_pgvector_literal(vector: list[float]) -> str:
+    """pgvector accepts vectors as a string literal like '[0.1,0.2,...]'."""
+    return "[" + ",".join(str(float(v)) for v in vector) + "]"
+
+
+rows = [
+    (
+        row["id"],
+        row["ticker"],
+        row["title"],
+        row["published_utc"],
+        _to_pgvector_literal(row["embedding"]),
+        EMBEDDING_MODEL_NAME,
+    )
+    for _, row in embeddings_pdf.iterrows()
+]
+
+BATCH_SIZE = 500
+upserted = 0
+
+with psycopg2.connect(lakebase_url) as conn:
+    with conn.cursor() as cur:
+        for start in range(0, len(rows), BATCH_SIZE):
+            batch = rows[start : start + BATCH_SIZE]
+            execute_values(
+                cur,
+                f"""
+                INSERT INTO {EMBEDDINGS_TABLE_NAME}
+                    (id, ticker, title, published_utc, embedding, model_name, embedded_at)
+                VALUES %s
+                ON CONFLICT (id) DO UPDATE
+                    SET ticker = EXCLUDED.ticker,
+                        title = EXCLUDED.title,
+                        published_utc = EXCLUDED.published_utc,
+                        embedding = EXCLUDED.embedding,
+                        model_name = EXCLUDED.model_name,
+                        embedded_at = EXCLUDED.embedded_at
+                """,
+                batch,
+                template="(%s, %s, %s, %s, %s::vector, %s, now())",
+            )
+            upserted += len(batch)
+        conn.commit()
+
+print(f"Upserted {upserted} embeddings into {EMBEDDINGS_TABLE_NAME}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Sanity check: similarity search
+# MAGIC
+# MAGIC Quick smoke test showing the whole point of this pipeline for the
+# MAGIC context-engineering course - retrieving the most semantically similar
+# MAGIC news articles to a query using pgvector's cosine distance operator (`<=>`).
+
+# COMMAND ----------
+
+sample_query = "interest rate cuts impact on tech stocks"
+
+from sentence_transformers import SentenceTransformer
+
+_query_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+query_vector = _to_pgvector_literal(_query_model.encode(sample_query).tolist())
+
+with psycopg2.connect(lakebase_url) as conn:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT ticker, title, embedding <=> %s::vector AS cosine_distance
+            FROM {EMBEDDINGS_TABLE_NAME}
+            ORDER BY cosine_distance ASC
+            LIMIT 5
+            """,
+            (query_vector,),
+        )
+        for ticker, title, distance in cur.fetchall():
+            print(f"[{ticker}] {title!r}  (distance={distance:.4f})")

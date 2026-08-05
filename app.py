@@ -28,6 +28,14 @@ _w = WorkspaceClient()
 
 TABLE_NAME = os.environ.get("MASSIVE_TABLE_NAME", "massive_records")
 WATCHLIST_TABLE_NAME = os.environ.get("WATCHLIST_TABLE_NAME", "watchlist")
+NEWS_TABLE_NAME = os.environ.get("NEWS_TABLE_NAME", "ticker_news_documents")
+
+# Tickers to fetch news for by default (comma-separated), e.g. "AAPL,MSFT,GOOGL"
+DEFAULT_NEWS_TICKERS = [
+    t.strip().upper()
+    for t in os.environ.get("NEWS_TICKERS", "AAPL,MSFT,GOOGL,AMZN,TSLA").split(",")
+    if t.strip()
+]
 
 # Basic stock ticker shape check: 1-10 uppercase letters, with an optional
 # ".X" or ".XX" share-class suffix (e.g. "BRK.B"). This rejects obviously
@@ -60,6 +68,38 @@ def ensure_watchlist_table():
             PRIMARY KEY (symbol, email)
         )
         """
+    )
+
+
+def ensure_news_table():
+    """
+    Create the raw ticker-news documents table in Lakebase if it doesn't
+    exist yet. This is the RAW document store the Spark notebook
+    (notebooks/ingest_ticker_news_embeddings.py) reads from to compute
+    vector embeddings into a separate `<NEWS_TABLE_NAME>_embeddings` table.
+    """
+    lakebase.run_write(
+        f"""
+        CREATE TABLE IF NOT EXISTS {NEWS_TABLE_NAME} (
+            id TEXT PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            author TEXT,
+            article_url TEXT,
+            publisher_name TEXT,
+            keywords JSONB,
+            sentiment TEXT,
+            sentiment_reasoning TEXT,
+            published_utc TIMESTAMPTZ,
+            payload JSONB NOT NULL,
+            synced_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    lakebase.run_write(
+        f"CREATE INDEX IF NOT EXISTS idx_{NEWS_TABLE_NAME}_ticker "
+        f"ON {NEWS_TABLE_NAME} (ticker)"
     )
 
 
@@ -136,6 +176,34 @@ def sync_from_massive():
     return jsonify({"synced": total})
 
 
+@app.route("/news/sync", methods=["POST"])
+def sync_news_from_massive():
+    """
+    Pull recent news articles for a set of tickers from Massive (ONE API
+    call per ticker, via MassiveClient.get_news) and upsert them into the
+    ticker_news_documents table in Lakebase.
+
+    Body (optional JSON): {"tickers": ["AAPL", "MSFT"], "limit": 50}
+    Defaults to DEFAULT_NEWS_TICKERS when no tickers are supplied.
+    """
+    ensure_news_table()
+    client = MassiveClient()
+
+    body = request.json if request.is_json else {}
+    tickers = body.get("tickers") or DEFAULT_NEWS_TICKERS
+    tickers = [t.strip().upper() for t in tickers if isinstance(t, str) and t.strip()]
+    limit = int(body.get("limit", 50))
+
+    total = 0
+    for ticker in tickers:
+        if not _TICKER_RE.match(ticker):
+            continue
+        articles = client.get_news(ticker, limit=limit)
+        total += _upsert_news_batch(ticker, articles)
+
+    return jsonify({"synced": total, "tickers": tickers})
+
+
 @app.route("/watchlist", methods=["GET"])
 def get_watchlist():
     """Return the current user's watchlist symbols, with their last known price."""
@@ -197,6 +265,27 @@ def add_to_watchlist():
     return jsonify({"symbol": symbol, "email": email, "latest_price": price})
 
 
+@app.route("/watchlist/<symbol>", methods=["DELETE"])
+def delete_from_watchlist(symbol: str):
+    """Remove a single symbol from the current user's watchlist."""
+    ensure_watchlist_table()
+
+    symbol = symbol.strip().upper() if isinstance(symbol, str) else ""
+    if not symbol or not _TICKER_RE.match(symbol):
+        return jsonify({"error": f"Invalid ticker symbol: {symbol!r}"}), 400
+
+    email = _current_user_email()
+    deleted = lakebase.run_write(
+        f"DELETE FROM {WATCHLIST_TABLE_NAME} WHERE symbol = %s AND email = %s",
+        (symbol, email),
+    )
+
+    if not deleted:
+        return jsonify({"error": f"{symbol} is not on your watchlist"}), 404
+
+    return jsonify({"symbol": symbol, "email": email, "deleted": True})
+
+
 def _extract_latest_price(data: dict) -> float | None:
     """Pull the trade price out of the Massive 'previous close' response shape.
 
@@ -247,6 +336,70 @@ def _upsert_batch(items: list[dict]) -> int:
                             synced_at = EXCLUDED.synced_at
                     """,
                     (str(item.get("id")), _json.dumps(item)),
+                )
+                count += 1
+            conn.commit()
+    return count
+
+
+def _upsert_news_batch(ticker: str, articles: list[dict]) -> int:
+    """Upsert news articles for a single ticker into the news documents table.
+
+    Flattens the top-level "insights" sentiment entry that matches this
+    ticker (if present) into its own columns so the Spark notebook can read
+    plain text columns instead of parsing JSONB for the common case.
+    """
+    import json as _json
+
+    count = 0
+    with lakebase.get_connection() as conn:
+        with conn.cursor() as cur:
+            for article in articles:
+                sentiment = None
+                sentiment_reasoning = None
+                for insight in article.get("insights", []) or []:
+                    if insight.get("ticker") == ticker:
+                        sentiment = insight.get("sentiment")
+                        sentiment_reasoning = insight.get("sentiment_reasoning")
+                        break
+
+                publisher = article.get("publisher") or {}
+                cur.execute(
+                    f"""
+                    INSERT INTO {NEWS_TABLE_NAME} (
+                        id, ticker, title, description, author, article_url,
+                        publisher_name, keywords, sentiment, sentiment_reasoning,
+                        published_utc, payload, synced_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                    ON CONFLICT (id) DO UPDATE
+                        SET ticker = EXCLUDED.ticker,
+                            title = EXCLUDED.title,
+                            description = EXCLUDED.description,
+                            author = EXCLUDED.author,
+                            article_url = EXCLUDED.article_url,
+                            publisher_name = EXCLUDED.publisher_name,
+                            keywords = EXCLUDED.keywords,
+                            sentiment = EXCLUDED.sentiment,
+                            sentiment_reasoning = EXCLUDED.sentiment_reasoning,
+                            published_utc = EXCLUDED.published_utc,
+                            payload = EXCLUDED.payload,
+                            synced_at = EXCLUDED.synced_at
+                    """,
+                    (
+                        str(article.get("id")),
+                        ticker,
+                        article.get("title", ""),
+                        article.get("description"),
+                        article.get("author"),
+                        article.get("article_url"),
+                        publisher.get("name"),
+                        _json.dumps(article.get("keywords", [])),
+                        sentiment,
+                        sentiment_reasoning,
+                        article.get("published_utc"),
+                        _json.dumps(article),
+                    ),
                 )
                 count += 1
             conn.commit()

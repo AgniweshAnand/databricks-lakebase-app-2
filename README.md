@@ -8,11 +8,14 @@ A minimal Databricks App that:
 
 ## Files
 
-- `app.py` - Flask app: `/healthz`, `/records` (GET), `/sync` (POST)
+- `app.py` - Flask app: `/healthz`, `/records` (GET), `/sync` (POST), `/watchlist` (GET/POST/DELETE), `/news/sync` (POST)
 - `lakebase.py` - Lakebase connection helper (single `LAKEBASE_URL`, psycopg2 + SQLAlchemy)
-- `massive_client.py` - Massive API client with pagination generator for large datasets
+- `massive_client.py` - Massive API client: pagination generator for large datasets, `get_latest_price`, `get_news`
 - `setup_secrets.py` - One-time script to create the secret scopes and store the Massive API key + Lakebase URL
 - `app.yaml` - Databricks App deployment config (command + env vars)
+- `templates/index.html` - Watchlist UI (add + remove tickers)
+- `notebooks/ingest_ticker_news_embeddings.py` - Spark notebook: reads `ticker_news_documents`, computes embeddings, writes `ticker_news_embeddings` (pgvector)
+- `databricks.yml` + `resources/ingest_ticker_news_embeddings_job.yml` - Databricks Asset Bundle config that schedules the notebook above as a Workflow (see [Scheduling the embeddings notebook](#scheduling-the-embeddings-notebook-as-a-databricks-workflow))
 - `.env.example` - Local dev env var template (copy to `.env`, do not commit real values)
 
 ## Step-by-step setup
@@ -119,6 +122,56 @@ All of this is done through the Databricks workspace UI:
 - `POST /sync?batch_size=500` with optional JSON body `{"path": "/records"}` - pull from Massive API and upsert into Lakebase
 - `GET /watchlist` - get the current user's watchlist symbols with last known price
 - `POST /watchlist` - add/update a symbol on the current user's watchlist
+- `DELETE /watchlist/<symbol>` - remove a symbol from the current user's watchlist
+- `POST /news/sync` with optional JSON body `{"tickers": ["AAPL", "MSFT"], "limit": 50}` - pull recent news per ticker from Massive and upsert into `ticker_news_documents`
+
+## Scheduling the embeddings notebook as a Databricks Workflow
+
+`notebooks/ingest_ticker_news_embeddings.py` turns the raw rows in `ticker_news_documents`
+(populated by `POST /news/sync`) into vector embeddings in `ticker_news_embeddings`. You can run it
+on a schedule two ways — pick whichever fits your setup:
+
+### Option A: Databricks Asset Bundle (CLI, version-controlled)
+
+This repo already includes bundle config for this: `databricks.yml` +
+`resources/ingest_ticker_news_embeddings_job.yml`. This is the recommended path if you want the
+job definition tracked in git alongside the code.
+
+1. Set the real workspace URL in `databricks.yml` (replace `<your-workspace-instance>`).
+2. Deploy: `databricks bundle deploy -t dev`
+3. Test it once manually: `databricks bundle run ingest_ticker_news_embeddings_job -t dev`
+4. Once you've confirmed a successful run, flip `pause_status: PAUSED` to `pause_status: UNPAUSED`
+   in `resources/ingest_ticker_news_embeddings_job.yml` and redeploy to turn on the daily schedule.
+
+### Option B: Workflows UI (no CLI required)
+
+If you'd rather not use the CLI, you can create the equivalent job by hand in the Databricks UI:
+
+1. **Get the notebook into your workspace**: if you already created a Git folder for this repo
+   (see step 7 above), the notebook is already there at `notebooks/ingest_ticker_news_embeddings.py`.
+   Otherwise, upload/import it via **Workspace** > **Create** > **Notebook** > **Import**.
+2. **Create the job**: go to **Workflows** (left sidebar) > **Jobs** > **Create Job**.
+3. **Add a task**:
+   - Task type: **Notebook**.
+   - Notebook path: browse to `notebooks/ingest_ticker_news_embeddings.py` in your Git folder.
+   - Cluster: choose **New job cluster** (a small general-purpose cluster is enough) or an existing
+     cluster/serverless, if available.
+   - Under **Parameters**, add the same widget values the notebook expects:
+     - `news_table_name` = `ticker_news_documents`
+     - `embeddings_table_name` = `ticker_news_embeddings`
+     - `embedding_model` = `sentence-transformers/all-MiniLM-L6-v2`
+     - `lakebase_secret_scope` = `database`
+     - `lakebase_secret_key` = `lakebase-url`
+4. **Add a schedule**: click **Add trigger** on the job, choose **Scheduled**, and set it to run
+   daily (e.g. 6:00 AM UTC) using either the simple picker or a cron expression
+   (`0 0 6 * * ?`, timezone UTC).
+5. **Add a failure notification**: under **Notifications**, add your email/Slack webhook for
+   on-failure alerts.
+6. Click **Create** and optionally **Run now** to validate the job before its first scheduled run.
+
+Both options produce the same result — a Databricks Workflow that runs the notebook and refreshes
+`ticker_news_embeddings`. The Asset Bundle keeps the definition in git and reproducible across
+workspaces; the UI path is quicker for a one-off class demo but isn't tracked in version control.
 
 ## Enabling Change Data Feed (CDF) for Postgres tables
 
