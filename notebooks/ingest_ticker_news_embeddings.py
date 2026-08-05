@@ -24,9 +24,9 @@
 # MAGIC    retrieve fine-grained passages from article bodies, not just
 # MAGIC    title/description.
 # MAGIC
-# MAGIC It re-uses the SAME Lakebase secret (`LAKEBASE_SECRET_SCOPE` /
-# MAGIC `LAKEBASE_SECRET_KEY`) that `lakebase.py` uses in the Flask app, so no
-# MAGIC extra secrets need to be created for this notebook.
+# MAGIC It re-uses the SAME Lakebase secret (scope `database`, key `lakebase-url`)
+# MAGIC that `lakebase.py` uses in the Flask app, so no extra secrets need to be
+# MAGIC created for this notebook.
 
 # COMMAND ----------
 
@@ -52,8 +52,6 @@ dbutils.widgets.text("news_table_name", "ticker_news_documents", "Destination ta
 dbutils.widgets.text("embeddings_table_name", "ticker_news_embeddings", "Destination table (vectors)")
 dbutils.widgets.text("chunk_embeddings_table_name", "ticker_news_chunk_embeddings", "Destination table (chunk vectors)")
 dbutils.widgets.text("embedding_model", "sentence-transformers/all-MiniLM-L6-v2", "Embedding model")
-dbutils.widgets.text("lakebase_secret_scope", "database", "Lakebase secret scope")
-dbutils.widgets.text("lakebase_secret_key", "lakebase-url", "Lakebase secret key")
 dbutils.widgets.text("massive_secret_scope", "massive", "Massive API secret scope")
 dbutils.widgets.text("massive_secret_key", "api-key", "Massive API secret key")
 dbutils.widgets.text("massive_api_base_url", "https://api.massive.com", "Massive API base URL")
@@ -67,13 +65,11 @@ NEWS_TABLE_NAME = dbutils.widgets.get("news_table_name")
 EMBEDDINGS_TABLE_NAME = dbutils.widgets.get("embeddings_table_name")
 CHUNK_EMBEDDINGS_TABLE_NAME = dbutils.widgets.get("chunk_embeddings_table_name")
 EMBEDDING_MODEL_NAME = dbutils.widgets.get("embedding_model")
-LAKEBASE_SECRET_SCOPE = dbutils.widgets.get("lakebase_secret_scope")
 MASSIVE_SECRET_SCOPE = dbutils.widgets.get("massive_secret_scope")
 MASSIVE_SECRET_KEY = dbutils.widgets.get("massive_secret_key")
 MASSIVE_API_BASE_URL = dbutils.widgets.get("massive_api_base_url")
 NEWS_FETCH_LIMIT = int(dbutils.widgets.get("news_fetch_limit"))
 MAX_REQUESTS_PER_MINUTE = int(dbutils.widgets.get("max_requests_per_minute"))
-LAKEBASE_SECRET_KEY = dbutils.widgets.get("lakebase_secret_key")
 CHUNK_SIZE = int(dbutils.widgets.get("chunk_size"))
 CHUNK_OVERLAP = int(dbutils.widgets.get("chunk_overlap"))
 
@@ -130,7 +126,7 @@ w = WorkspaceClient()
 
 
 def get_lakebase_url() -> str:
-    secret = w.secrets.get_secret(scope=LAKEBASE_SECRET_SCOPE, key=LAKEBASE_SECRET_KEY)
+    secret = w.secrets.get_secret(scope="database", key="lakebase-url")
     return base64.b64decode(secret.value).decode("utf-8")
 
 

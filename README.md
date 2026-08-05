@@ -167,8 +167,6 @@ If you'd rather not use the CLI, you can create the equivalent job by hand in th
      - `embeddings_table_name` = `ticker_news_embeddings`
      - `chunk_embeddings_table_name` = `ticker_news_chunk_embeddings`
      - `embedding_model` = `sentence-transformers/all-MiniLM-L6-v2`
-     - `lakebase_secret_scope` = `database`
-     - `lakebase_secret_key` = `lakebase-url`
      - `massive_secret_scope` = `massive`
      - `massive_secret_key` = `api-key`
      - `massive_api_base_url` = `https://api.massive.com`
