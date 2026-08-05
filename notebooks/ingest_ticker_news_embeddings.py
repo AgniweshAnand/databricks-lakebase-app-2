@@ -30,7 +30,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install -q sentence-transformers pgvector trafilatura requests
+# MAGIC %pip install -q sentence-transformers trafilatura requests
 
 # COMMAND ----------
 
@@ -111,9 +111,9 @@ print(f"Using model {EMBEDDING_MODEL_NAME!r} -> {EMBEDDING_DIM}-dim vectors")
 # MAGIC
 # MAGIC Same secret, same decoding scheme as `lakebase.py`: a single base64-encoded
 # MAGIC Postgres URL (`postgresql://role:password@host:5432/db?sslmode=require`)
-# MAGIC stored in a Databricks secret scope. We parse it into the pieces Spark's
-# MAGIC JDBC reader needs (url/user/password) and also keep the raw DSN for the
-# MAGIC psycopg2 writer step (pgvector values can't go through the JDBC writer).
+# MAGIC stored in a Databricks secret scope. We parse it into the pieces both
+# MAGIC Spark's JDBC reader AND the raw JDBC connection helper below need
+# MAGIC (url/user/password).
 
 # COMMAND ----------
 
@@ -144,6 +144,79 @@ jdbc_properties = {
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Raw JDBC connection helper (no psycopg2)
+# MAGIC
+# MAGIC `psycopg2`'s native C extension has been observed to SIGABRT on some
+# MAGIC Databricks serverless compute (crashes in a background credential-refresh
+# MAGIC thread unrelated to this notebook's own code). Since Spark already loads
+# MAGIC the `org.postgresql.Driver` JDBC driver for `spark.read.jdbc(...)`, this
+# MAGIC notebook uses that SAME driver via py4j for every raw-SQL write (DDL,
+# MAGIC upserts, `::vector` casts) instead of psycopg2 - avoiding the crashing
+# MAGIC dependency entirely while still running plain Postgres SQL.
+
+# COMMAND ----------
+
+from contextlib import contextmanager
+
+_jvm = spark._sc._gateway.jvm
+
+
+@contextmanager
+def jdbc_connection():
+    """Open a java.sql.Connection to Lakebase through the same JDBC driver
+    Spark's JDBC reader uses, closing it on exit."""
+    conn = _jvm.java.sql.DriverManager.getConnection(
+        jdbc_url, jdbc_properties["user"], jdbc_properties["password"]
+    )
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def execute_ddl(conn, sql: str) -> None:
+    """Run a single DDL/DML statement with no parameters."""
+    stmt = conn.createStatement()
+    try:
+        stmt.execute(sql)
+    finally:
+        stmt.close()
+
+
+def execute_batch(conn, sql: str, rows: list[tuple]) -> int:
+    """Run one parameterized statement per row via JDBC batching. Values are
+    bound positionally with setObject/setNull; `?::vector` casts in the SQL
+    text handle the pgvector column since JDBC has no native vector type."""
+    pstmt = conn.prepareStatement(sql)
+    try:
+        for row in rows:
+            for i, value in enumerate(row, start=1):
+                if value is None:
+                    pstmt.setNull(i, _jvm.java.sql.Types.VARCHAR)
+                else:
+                    pstmt.setObject(i, value)
+            pstmt.addBatch()
+        pstmt.executeBatch()
+    finally:
+        pstmt.close()
+    return len(rows)
+
+
+def query_column(conn, sql: str) -> list[str]:
+    """Run a SELECT and return the first column of every row as strings."""
+    stmt = conn.createStatement()
+    try:
+        rs = stmt.executeQuery(sql)
+        values = []
+        while rs.next():
+            values.append(rs.getString(1))
+        return values
+    finally:
+        stmt.close()
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Fetch news from Massive for watchlisted tickers
 # MAGIC
 # MAGIC This ETL is now self-contained: instead of relying on the Flask app's
@@ -159,9 +232,9 @@ jdbc_properties = {
 # COMMAND ----------
 
 import base64 as _b64
+import json as _json
 import time
 
-import psycopg2
 import requests
 
 
@@ -173,10 +246,9 @@ def get_massive_api_key() -> str:
 def get_watchlist_tickers() -> list[str]:
     """Distinct, uppercased ticker symbols currently tracked across all users
     in the watchlist table - these are the only tickers we fetch news for."""
-    with psycopg2.connect(lakebase_url) as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"SELECT DISTINCT symbol FROM {WATCHLIST_TABLE_NAME}")
-            return [row[0].strip().upper() for row in cur.fetchall() if row[0]]
+    with jdbc_connection() as conn:
+        symbols = query_column(conn, f"SELECT DISTINCT symbol FROM {WATCHLIST_TABLE_NAME}")
+    return [symbol.strip().upper() for symbol in symbols if symbol]
 
 
 def fetch_news_for_ticker(session: requests.Session, ticker: str, limit: int) -> list[dict]:
@@ -194,91 +266,93 @@ def fetch_news_for_ticker(session: requests.Session, ticker: str, limit: int) ->
 def ensure_news_table():
     """Same schema as ensure_news_table() in app.py, kept in sync so either
     the Flask app's POST /news/sync or this notebook can populate the table."""
-    with psycopg2.connect(lakebase_url) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {NEWS_TABLE_NAME} (
-                    id TEXT PRIMARY KEY,
-                    ticker TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    description TEXT,
-                    author TEXT,
-                    article_url TEXT,
-                    publisher_name TEXT,
-                    keywords JSONB,
-                    sentiment TEXT,
-                    sentiment_reasoning TEXT,
-                    published_utc TIMESTAMPTZ,
-                    payload JSONB NOT NULL,
-                    synced_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                )
-                """
+    with jdbc_connection() as conn:
+        execute_ddl(
+            conn,
+            f"""
+            CREATE TABLE IF NOT EXISTS {NEWS_TABLE_NAME} (
+                id TEXT PRIMARY KEY,
+                ticker TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT,
+                author TEXT,
+                article_url TEXT,
+                publisher_name TEXT,
+                keywords JSONB,
+                sentiment TEXT,
+                sentiment_reasoning TEXT,
+                published_utc TIMESTAMPTZ,
+                payload JSONB NOT NULL,
+                synced_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
-            cur.execute(
-                f"CREATE INDEX IF NOT EXISTS idx_{NEWS_TABLE_NAME}_ticker "
-                f"ON {NEWS_TABLE_NAME} (ticker)"
-            )
-        conn.commit()
+            """,
+        )
+        execute_ddl(
+            conn,
+            f"CREATE INDEX IF NOT EXISTS idx_{NEWS_TABLE_NAME}_ticker ON {NEWS_TABLE_NAME} (ticker)",
+        )
 
 
 def upsert_news_batch(ticker: str, articles: list[dict]) -> int:
-    """Same upsert logic as _upsert_news_batch() in app.py."""
-    import json as _json
+    """Same upsert logic as _upsert_news_batch() in app.py, but via JDBC
+    batching instead of psycopg2.extras.execute_values."""
+    rows = []
+    for article in articles:
+        sentiment = None
+        sentiment_reasoning = None
+        for insight in article.get("insights", []) or []:
+            if insight.get("ticker") == ticker:
+                sentiment = insight.get("sentiment")
+                sentiment_reasoning = insight.get("sentiment_reasoning")
+                break
 
-    count = 0
-    with psycopg2.connect(lakebase_url) as conn:
-        with conn.cursor() as cur:
-            for article in articles:
-                sentiment = None
-                sentiment_reasoning = None
-                for insight in article.get("insights", []) or []:
-                    if insight.get("ticker") == ticker:
-                        sentiment = insight.get("sentiment")
-                        sentiment_reasoning = insight.get("sentiment_reasoning")
-                        break
+        publisher = article.get("publisher") or {}
+        rows.append(
+            (
+                str(article.get("id")),
+                ticker,
+                article.get("title", ""),
+                article.get("description"),
+                article.get("author"),
+                article.get("article_url"),
+                publisher.get("name"),
+                _json.dumps(article.get("keywords", [])),
+                sentiment,
+                sentiment_reasoning,
+                article.get("published_utc"),
+                _json.dumps(article),
+            )
+        )
 
-                publisher = article.get("publisher") or {}
-                cur.execute(
-                    f"""
-                    INSERT INTO {NEWS_TABLE_NAME} (
-                        id, ticker, title, description, author, article_url,
-                        publisher_name, keywords, sentiment, sentiment_reasoning,
-                        published_utc, payload, synced_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
-                    ON CONFLICT (id) DO UPDATE
-                        SET ticker = EXCLUDED.ticker,
-                            title = EXCLUDED.title,
-                            description = EXCLUDED.description,
-                            author = EXCLUDED.author,
-                            article_url = EXCLUDED.article_url,
-                            publisher_name = EXCLUDED.publisher_name,
-                            keywords = EXCLUDED.keywords,
-                            sentiment = EXCLUDED.sentiment,
-                            sentiment_reasoning = EXCLUDED.sentiment_reasoning,
-                            published_utc = EXCLUDED.published_utc,
-                            payload = EXCLUDED.payload,
-                            synced_at = EXCLUDED.synced_at
-                    """,
-                    (
-                        str(article.get("id")),
-                        ticker,
-                        article.get("title", ""),
-                        article.get("description"),
-                        article.get("author"),
-                        article.get("article_url"),
-                        publisher.get("name"),
-                        _json.dumps(article.get("keywords", [])),
-                        sentiment,
-                        sentiment_reasoning,
-                        article.get("published_utc"),
-                        _json.dumps(article),
-                    ),
-                )
-                count += 1
-            conn.commit()
-    return count
+    if not rows:
+        return 0
+
+    with jdbc_connection() as conn:
+        return execute_batch(
+            conn,
+            f"""
+            INSERT INTO {NEWS_TABLE_NAME} (
+                id, ticker, title, description, author, article_url,
+                publisher_name, keywords, sentiment, sentiment_reasoning,
+                published_utc, payload, synced_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?::timestamptz, ?::jsonb, now())
+            ON CONFLICT (id) DO UPDATE
+                SET ticker = EXCLUDED.ticker,
+                    title = EXCLUDED.title,
+                    description = EXCLUDED.description,
+                    author = EXCLUDED.author,
+                    article_url = EXCLUDED.article_url,
+                    publisher_name = EXCLUDED.publisher_name,
+                    keywords = EXCLUDED.keywords,
+                    sentiment = EXCLUDED.sentiment,
+                    sentiment_reasoning = EXCLUDED.sentiment_reasoning,
+                    published_utc = EXCLUDED.published_utc,
+                    payload = EXCLUDED.payload,
+                    synced_at = EXCLUDED.synced_at
+            """,
+            rows,
+        )
 
 
 ensure_news_table()
@@ -395,52 +469,47 @@ print(f"Computed {len(embeddings_pdf)} embeddings using {EMBEDDING_MODEL_NAME}")
 # MAGIC %md
 # MAGIC ## Ensure the pgvector destination table exists
 # MAGIC
-# MAGIC `pgvector` isn't a JDBC-native type, so we create the table (and enable
-# MAGIC the extension) with a direct psycopg2 connection rather than Spark's JDBC
-# MAGIC writer, which can't express a `vector(N)` column.
+# MAGIC `pgvector` isn't a JDBC-native type, but plain SQL text (`vector(N)`,
+# MAGIC `::vector` casts) works fine over a raw JDBC connection - no psycopg2
+# MAGIC needed.
 
 # COMMAND ----------
 
-import psycopg2
-
-with psycopg2.connect(lakebase_url) as conn:
-    with conn.cursor() as cur:
-        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {EMBEDDINGS_TABLE_NAME} (
-                id TEXT PRIMARY KEY,
-                ticker TEXT NOT NULL,
-                title TEXT NOT NULL,
-                published_utc TIMESTAMPTZ,
-                embedding VECTOR({EMBEDDING_DIM}) NOT NULL,
-                model_name TEXT NOT NULL,
-                embedded_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-            """
+with jdbc_connection() as conn:
+    execute_ddl(conn, "CREATE EXTENSION IF NOT EXISTS vector")
+    execute_ddl(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS {EMBEDDINGS_TABLE_NAME} (
+            id TEXT PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            title TEXT NOT NULL,
+            published_utc TIMESTAMPTZ,
+            embedding VECTOR({EMBEDDING_DIM}) NOT NULL,
+            model_name TEXT NOT NULL,
+            embedded_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
-        # Approximate-nearest-neighbor index for fast cosine similarity search.
-        cur.execute(
-            f"""
-            CREATE INDEX IF NOT EXISTS idx_{EMBEDDINGS_TABLE_NAME}_embedding
-            ON {EMBEDDINGS_TABLE_NAME}
-            USING hnsw (embedding vector_cosine_ops)
-            """
-        )
-    conn.commit()
+        """,
+    )
+    # Approximate-nearest-neighbor index for fast cosine similarity search.
+    execute_ddl(
+        conn,
+        f"""
+        CREATE INDEX IF NOT EXISTS idx_{EMBEDDINGS_TABLE_NAME}_embedding
+        ON {EMBEDDINGS_TABLE_NAME}
+        USING hnsw (embedding vector_cosine_ops)
+        """,
+    )
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Upsert embeddings into Lakebase
 # MAGIC
-# MAGIC Written in batches with `psycopg2.extras.execute_values` for throughput.
+# MAGIC Written in batches via JDBC's `addBatch`/`executeBatch` for throughput.
 # MAGIC Each embedding is cast to Postgres' `vector` type via `::vector`.
 
 # COMMAND ----------
-
-from psycopg2.extras import execute_values
-
 
 def _to_pgvector_literal(vector: list[float]) -> str:
     """pgvector accepts vectors as a string literal like '[0.1,0.2,...]'."""
@@ -462,29 +531,25 @@ rows = [
 BATCH_SIZE = 500
 upserted = 0
 
-with psycopg2.connect(lakebase_url) as conn:
-    with conn.cursor() as cur:
-        for start in range(0, len(rows), BATCH_SIZE):
-            batch = rows[start : start + BATCH_SIZE]
-            execute_values(
-                cur,
-                f"""
-                INSERT INTO {EMBEDDINGS_TABLE_NAME}
-                    (id, ticker, title, published_utc, embedding, model_name, embedded_at)
-                VALUES %s
-                ON CONFLICT (id) DO UPDATE
-                    SET ticker = EXCLUDED.ticker,
-                        title = EXCLUDED.title,
-                        published_utc = EXCLUDED.published_utc,
-                        embedding = EXCLUDED.embedding,
-                        model_name = EXCLUDED.model_name,
-                        embedded_at = EXCLUDED.embedded_at
-                """,
-                batch,
-                template="(%s, %s, %s, %s, %s::vector, %s, now())",
-            )
-            upserted += len(batch)
-        conn.commit()
+with jdbc_connection() as conn:
+    for start in range(0, len(rows), BATCH_SIZE):
+        batch = rows[start : start + BATCH_SIZE]
+        upserted += execute_batch(
+            conn,
+            f"""
+            INSERT INTO {EMBEDDINGS_TABLE_NAME}
+                (id, ticker, title, published_utc, embedding, model_name, embedded_at)
+            VALUES (?, ?, ?, ?::timestamptz, ?::vector, ?, now())
+            ON CONFLICT (id) DO UPDATE
+                SET ticker = EXCLUDED.ticker,
+                    title = EXCLUDED.title,
+                    published_utc = EXCLUDED.published_utc,
+                    embedding = EXCLUDED.embedding,
+                    model_name = EXCLUDED.model_name,
+                    embedded_at = EXCLUDED.embedded_at
+            """,
+            batch,
+        )
 
 print(f"Upserted {upserted} embeddings into {EMBEDDINGS_TABLE_NAME}")
 
@@ -597,32 +662,32 @@ print(f"Computed {len(chunks_pdf)} chunk embeddings using {EMBEDDING_MODEL_NAME}
 
 # COMMAND ----------
 
-with psycopg2.connect(lakebase_url) as conn:
-    with conn.cursor() as cur:
-        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {CHUNK_EMBEDDINGS_TABLE_NAME} (
-                id TEXT PRIMARY KEY,
-                article_id TEXT NOT NULL,
-                ticker TEXT NOT NULL,
-                chunk_index INT NOT NULL,
-                chunk_text TEXT NOT NULL,
-                embedding VECTOR({EMBEDDING_DIM}) NOT NULL,
-                model_name TEXT NOT NULL,
-                embedded_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-            """
+with jdbc_connection() as conn:
+    execute_ddl(conn, "CREATE EXTENSION IF NOT EXISTS vector")
+    execute_ddl(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS {CHUNK_EMBEDDINGS_TABLE_NAME} (
+            id TEXT PRIMARY KEY,
+            article_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            chunk_index INT NOT NULL,
+            chunk_text TEXT NOT NULL,
+            embedding VECTOR({EMBEDDING_DIM}) NOT NULL,
+            model_name TEXT NOT NULL,
+            embedded_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
-        # Approximate-nearest-neighbor index for fast cosine similarity search.
-        cur.execute(
-            f"""
-            CREATE INDEX IF NOT EXISTS idx_{CHUNK_EMBEDDINGS_TABLE_NAME}_embedding
-            ON {CHUNK_EMBEDDINGS_TABLE_NAME}
-            USING hnsw (embedding vector_cosine_ops)
-            """
-        )
-    conn.commit()
+        """,
+    )
+    # Approximate-nearest-neighbor index for fast cosine similarity search.
+    execute_ddl(
+        conn,
+        f"""
+        CREATE INDEX IF NOT EXISTS idx_{CHUNK_EMBEDDINGS_TABLE_NAME}_embedding
+        ON {CHUNK_EMBEDDINGS_TABLE_NAME}
+        USING hnsw (embedding vector_cosine_ops)
+        """,
+    )
 
 # COMMAND ----------
 
@@ -646,30 +711,26 @@ chunk_rows = [
 
 chunk_upserted = 0
 
-with psycopg2.connect(lakebase_url) as conn:
-    with conn.cursor() as cur:
-        for start in range(0, len(chunk_rows), BATCH_SIZE):
-            batch = chunk_rows[start : start + BATCH_SIZE]
-            execute_values(
-                cur,
-                f"""
-                INSERT INTO {CHUNK_EMBEDDINGS_TABLE_NAME}
-                    (id, article_id, ticker, chunk_index, chunk_text, embedding, model_name, embedded_at)
-                VALUES %s
-                ON CONFLICT (id) DO UPDATE
-                    SET article_id = EXCLUDED.article_id,
-                        ticker = EXCLUDED.ticker,
-                        chunk_index = EXCLUDED.chunk_index,
-                        chunk_text = EXCLUDED.chunk_text,
-                        embedding = EXCLUDED.embedding,
-                        model_name = EXCLUDED.model_name,
-                        embedded_at = EXCLUDED.embedded_at
-                """,
-                batch,
-                template="(%s, %s, %s, %s, %s, %s::vector, %s, now())",
-            )
-            chunk_upserted += len(batch)
-        conn.commit()
+with jdbc_connection() as conn:
+    for start in range(0, len(chunk_rows), BATCH_SIZE):
+        batch = chunk_rows[start : start + BATCH_SIZE]
+        chunk_upserted += execute_batch(
+            conn,
+            f"""
+            INSERT INTO {CHUNK_EMBEDDINGS_TABLE_NAME}
+                (id, article_id, ticker, chunk_index, chunk_text, embedding, model_name, embedded_at)
+            VALUES (?, ?, ?, ?, ?, ?::vector, ?, now())
+            ON CONFLICT (id) DO UPDATE
+                SET article_id = EXCLUDED.article_id,
+                    ticker = EXCLUDED.ticker,
+                    chunk_index = EXCLUDED.chunk_index,
+                    chunk_text = EXCLUDED.chunk_text,
+                    embedding = EXCLUDED.embedding,
+                    model_name = EXCLUDED.model_name,
+                    embedded_at = EXCLUDED.embedded_at
+            """,
+            batch,
+        )
 
 print(f"Upserted {chunk_upserted} chunk embeddings into {CHUNK_EMBEDDINGS_TABLE_NAME}")
 
