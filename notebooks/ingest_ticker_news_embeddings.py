@@ -5,15 +5,18 @@
 # MAGIC This notebook is part of the **Context Engineering on Databricks** course.
 # MAGIC
 # MAGIC It:
-# MAGIC 1. Reads raw news documents from the `ticker_news_documents` table in
-# MAGIC    Lakebase (populated by `POST /news/sync` in the Flask app, which pulls
-# MAGIC    from the Massive `/v2/reference/news` endpoint - see `massive_client.py`).
-# MAGIC 2. Computes a sentence embedding for each article (title + description)
-# MAGIC    using Spark, distributed across the cluster via a pandas UDF.
-# MAGIC 3. Writes the embeddings into a `ticker_news_embeddings` table in
-# MAGIC    Lakebase, using the `pgvector` Postgres extension so downstream RAG /
-# MAGIC    context-engineering exercises can run similarity search directly in
-# MAGIC    Postgres.
+# MAGIC 1. Reads the `watchlist` table in Lakebase to find out which ticker
+# MAGIC    symbols are currently being tracked.
+# MAGIC 2. Fetches recent news for those tickers directly from the Massive
+# MAGIC    `/v2/reference/news` endpoint (see `massive_client.py` for the same
+# MAGIC    call shape used by the Flask app's `POST /news/sync` route), rate
+# MAGIC    limited to stay within the free Massive API tier's strict quota, and
+# MAGIC    upserts the results into the `ticker_news_documents` table.
+# MAGIC 3. Computes a sentence embedding for each article (title + description)
+# MAGIC    using Spark, distributed across the cluster via a pandas UDF, and
+# MAGIC    writes them into a `ticker_news_embeddings` table using the
+# MAGIC    `pgvector` Postgres extension so downstream RAG / context-engineering
+# MAGIC    exercises can run similarity search directly in Postgres.
 # MAGIC 4. Fetches the full article body for each `article_url` (via
 # MAGIC    `trafilatura`, which strips nav/ads/boilerplate from the raw HTML),
 # MAGIC    splits it into overlapping text chunks, embeds each chunk, and writes
@@ -315,8 +318,9 @@ print(f"Synced {news_synced} news articles into {NEWS_TABLE_NAME} for {len(ticke
 # MAGIC %md
 # MAGIC ## Load raw news documents with Spark
 # MAGIC
-# MAGIC Reads the whole `ticker_news_documents` table via JDBC into a Spark
-# MAGIC DataFrame so embedding computation can be distributed across the cluster.
+# MAGIC Reads the whole `ticker_news_documents` table (just synced from Massive
+# MAGIC above) via JDBC into a Spark DataFrame so embedding computation can be
+# MAGIC distributed across the cluster.
 
 # COMMAND ----------
 
@@ -673,58 +677,3 @@ with psycopg2.connect(lakebase_url) as conn:
 
 print(f"Upserted {chunk_upserted} chunk embeddings into {CHUNK_EMBEDDINGS_TABLE_NAME}")
 
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Sanity check: similarity search
-# MAGIC
-# MAGIC Quick smoke test showing the whole point of this pipeline for the
-# MAGIC context-engineering course - retrieving the most semantically similar
-# MAGIC news articles to a query using pgvector's cosine distance operator (`<=>`).
-
-# COMMAND ----------
-
-sample_query = "interest rate cuts impact on tech stocks"
-
-from sentence_transformers import SentenceTransformer
-
-_query_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-query_vector = _to_pgvector_literal(_query_model.encode(sample_query).tolist())
-
-with psycopg2.connect(lakebase_url) as conn:
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            SELECT ticker, title, embedding <=> %s::vector AS cosine_distance
-            FROM {EMBEDDINGS_TABLE_NAME}
-            ORDER BY cosine_distance ASC
-            LIMIT 5
-            """,
-            (query_vector,),
-        )
-        for ticker, title, distance in cur.fetchall():
-            print(f"[{ticker}] {title!r}  (distance={distance:.4f})")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC Same query, but against the article-content chunks instead of
-# MAGIC title/description - shows the finer-grained passages a RAG exercise
-# MAGIC would actually retrieve and feed into an LLM prompt.
-
-# COMMAND ----------
-
-with psycopg2.connect(lakebase_url) as conn:
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            SELECT ticker, chunk_index, chunk_text, embedding <=> %s::vector AS cosine_distance
-            FROM {CHUNK_EMBEDDINGS_TABLE_NAME}
-            ORDER BY cosine_distance ASC
-            LIMIT 5
-            """,
-            (query_vector,),
-        )
-        for ticker, chunk_index, chunk_text, distance in cur.fetchall():
-            preview = chunk_text[:120].replace("\n", " ")
-            print(f"[{ticker}] chunk#{chunk_index} {preview!r}...  (distance={distance:.4f})")
