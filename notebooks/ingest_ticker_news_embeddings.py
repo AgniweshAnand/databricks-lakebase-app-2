@@ -118,7 +118,7 @@ print(f"Using model {EMBEDDING_MODEL_NAME!r} -> {EMBEDDING_DIM}-dim vectors")
 # COMMAND ----------
 
 import base64
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 
 from databricks.sdk import WorkspaceClient
 
@@ -133,7 +133,11 @@ def get_lakebase_url() -> str:
 lakebase_url = get_lakebase_url()
 parsed = urlparse(lakebase_url)
 
+# Build JDBC URL without credentials
 jdbc_url = f"jdbc:postgresql://{parsed.hostname}:{parsed.port or 5432}{parsed.path}"
+print(f"Connecting to: {parsed.hostname}:{parsed.port or 5432}{parsed.path}")
+
+# Pass credentials and SSL settings in properties
 jdbc_properties = {
     "user": parsed.username,
     "password": parsed.password,
@@ -141,78 +145,40 @@ jdbc_properties = {
     "sslmode": "require",
 }
 
+print(f"User: {parsed.username}")
+print(f"Database: {parsed.path}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Test JDBC Connection
+# Test JDBC connection with embedded credentials
+try:
+    test_df = spark.read.jdbc(
+        url=jdbc_url,
+        table=WATCHLIST_TABLE_NAME,
+        properties=jdbc_properties
+    )
+    count = test_df.count()
+    print(f"✅ Connection successful! Found {count} rows in {WATCHLIST_TABLE_NAME}")
+    test_df.show(5)
+except Exception as e:
+    print(f"❌ Connection failed: {e}")
+
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Raw JDBC connection helper (no psycopg2)
+# MAGIC ## Database Setup Instructions
 # MAGIC
-# MAGIC `psycopg2`'s native C extension has been observed to SIGABRT on some
-# MAGIC Databricks serverless compute (crashes in a background credential-refresh
-# MAGIC thread unrelated to this notebook's own code). Since Spark already loads
-# MAGIC the `org.postgresql.Driver` JDBC driver for `spark.read.jdbc(...)`, this
-# MAGIC notebook uses that SAME driver via py4j for every raw-SQL write (DDL,
-# MAGIC upserts, `::vector` casts) instead of psycopg2 - avoiding the crashing
-# MAGIC dependency entirely while still running plain Postgres SQL.
-
-# COMMAND ----------
-
-from contextlib import contextmanager
-
-_jvm = spark._sc._gateway.jvm
-
-
-@contextmanager
-def jdbc_connection():
-    """Open a java.sql.Connection to Lakebase through the same JDBC driver
-    Spark's JDBC reader uses, closing it on exit."""
-    conn = _jvm.java.sql.DriverManager.getConnection(
-        jdbc_url, jdbc_properties["user"], jdbc_properties["password"]
-    )
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-
-def execute_ddl(conn, sql: str) -> None:
-    """Run a single DDL/DML statement with no parameters."""
-    stmt = conn.createStatement()
-    try:
-        stmt.execute(sql)
-    finally:
-        stmt.close()
-
-
-def execute_batch(conn, sql: str, rows: list[tuple]) -> int:
-    """Run one parameterized statement per row via JDBC batching. Values are
-    bound positionally with setObject/setNull; `?::vector` casts in the SQL
-    text handle the pgvector column since JDBC has no native vector type."""
-    pstmt = conn.prepareStatement(sql)
-    try:
-        for row in rows:
-            for i, value in enumerate(row, start=1):
-                if value is None:
-                    pstmt.setNull(i, _jvm.java.sql.Types.VARCHAR)
-                else:
-                    pstmt.setObject(i, value)
-            pstmt.addBatch()
-        pstmt.executeBatch()
-    finally:
-        pstmt.close()
-    return len(rows)
-
-
-def query_column(conn, sql: str) -> list[str]:
-    """Run a SELECT and return the first column of every row as strings."""
-    stmt = conn.createStatement()
-    try:
-        rs = stmt.executeQuery(sql)
-        values = []
-        while rs.next():
-            values.append(rs.getString(1))
-        return values
-    finally:
-        stmt.close()
+# MAGIC Before running this notebook, you must manually create the required tables
+# MAGIC in your Lakebase Postgres database:
+# MAGIC
+# MAGIC 1. Run `sql/01_setup_news_table.sql` to create `ticker_news_documents`
+# MAGIC 2. Run `sql/02_setup_embeddings_table.sql` to create `ticker_news_embeddings`
+# MAGIC    - Replace `{{EMBEDDING_DIM}}` with your model's dimension (e.g., 384)
+# MAGIC 3. Run `sql/03_setup_chunk_embeddings_table.sql` to create `ticker_news_chunk_embeddings`
+# MAGIC    - Replace `{{EMBEDDING_DIM}}` with your model's dimension (e.g., 384)
+# MAGIC
+# MAGIC This notebook uses Spark JDBC for all database operations - no psycopg2 required.
 
 # COMMAND ----------
 
@@ -234,8 +200,11 @@ def query_column(conn, sql: str) -> list[str]:
 import base64 as _b64
 import json as _json
 import time
+from datetime import datetime
 
 import requests
+from pyspark.sql.functions import col, current_timestamp, lit
+from pyspark.sql.types import StringType, StructField, StructType
 
 
 def get_massive_api_key() -> str:
@@ -246,9 +215,11 @@ def get_massive_api_key() -> str:
 def get_watchlist_tickers() -> list[str]:
     """Distinct, uppercased ticker symbols currently tracked across all users
     in the watchlist table - these are the only tickers we fetch news for."""
-    with jdbc_connection() as conn:
-        symbols = query_column(conn, f"SELECT DISTINCT symbol FROM {WATCHLIST_TABLE_NAME}")
-    return [symbol.strip().upper() for symbol in symbols if symbol]
+    watchlist_df = spark.read.jdbc(
+        url=jdbc_url, table=WATCHLIST_TABLE_NAME, properties=jdbc_properties
+    )
+    symbols = watchlist_df.select("symbol").distinct().collect()
+    return [row.symbol.strip().upper() for row in symbols if row.symbol]
 
 
 def fetch_news_for_ticker(session: requests.Session, ticker: str, limit: int) -> list[dict]:
@@ -263,39 +234,9 @@ def fetch_news_for_ticker(session: requests.Session, ticker: str, limit: int) ->
     return resp.json().get("results", [])
 
 
-def ensure_news_table():
-    """Same schema as ensure_news_table() in app.py, kept in sync so either
-    the Flask app's POST /news/sync or this notebook can populate the table."""
-    with jdbc_connection() as conn:
-        execute_ddl(
-            conn,
-            f"""
-            CREATE TABLE IF NOT EXISTS {NEWS_TABLE_NAME} (
-                id TEXT PRIMARY KEY,
-                ticker TEXT NOT NULL,
-                title TEXT NOT NULL,
-                description TEXT,
-                author TEXT,
-                article_url TEXT,
-                publisher_name TEXT,
-                keywords JSONB,
-                sentiment TEXT,
-                sentiment_reasoning TEXT,
-                published_utc TIMESTAMPTZ,
-                payload JSONB NOT NULL,
-                synced_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-            """,
-        )
-        execute_ddl(
-            conn,
-            f"CREATE INDEX IF NOT EXISTS idx_{NEWS_TABLE_NAME}_ticker ON {NEWS_TABLE_NAME} (ticker)",
-        )
-
-
-def upsert_news_batch(ticker: str, articles: list[dict]) -> int:
-    """Same upsert logic as _upsert_news_batch() in app.py, but via JDBC
-    batching instead of psycopg2.extras.execute_values."""
+def sync_news_to_spark(ticker: str, articles: list[dict]):
+    """Convert Massive API response to Spark DataFrame and write to Postgres.
+    Uses append mode with deduplication by reading existing IDs first."""
     rows = []
     for article in articles:
         sentiment = None
@@ -308,54 +249,52 @@ def upsert_news_batch(ticker: str, articles: list[dict]) -> int:
 
         publisher = article.get("publisher") or {}
         rows.append(
-            (
-                str(article.get("id")),
-                ticker,
-                article.get("title", ""),
-                article.get("description"),
-                article.get("author"),
-                article.get("article_url"),
-                publisher.get("name"),
-                _json.dumps(article.get("keywords", [])),
-                sentiment,
-                sentiment_reasoning,
-                article.get("published_utc"),
-                _json.dumps(article),
-            )
+            {
+                "id": str(article.get("id")),
+                "ticker": ticker,
+                "title": article.get("title", ""),
+                "description": article.get("description"),
+                "author": article.get("author"),
+                "article_url": article.get("article_url"),
+                "publisher_name": publisher.get("name"),
+                "keywords": _json.dumps(article.get("keywords", [])),
+                "sentiment": sentiment,
+                "sentiment_reasoning": sentiment_reasoning,
+                "published_utc": article.get("published_utc"),
+                "payload": _json.dumps(article),
+            }
         )
 
     if not rows:
         return 0
 
-    with jdbc_connection() as conn:
-        return execute_batch(
-            conn,
-            f"""
-            INSERT INTO {NEWS_TABLE_NAME} (
-                id, ticker, title, description, author, article_url,
-                publisher_name, keywords, sentiment, sentiment_reasoning,
-                published_utc, payload, synced_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?::timestamptz, ?::jsonb, now())
-            ON CONFLICT (id) DO UPDATE
-                SET ticker = EXCLUDED.ticker,
-                    title = EXCLUDED.title,
-                    description = EXCLUDED.description,
-                    author = EXCLUDED.author,
-                    article_url = EXCLUDED.article_url,
-                    publisher_name = EXCLUDED.publisher_name,
-                    keywords = EXCLUDED.keywords,
-                    sentiment = EXCLUDED.sentiment,
-                    sentiment_reasoning = EXCLUDED.sentiment_reasoning,
-                    published_utc = EXCLUDED.published_utc,
-                    payload = EXCLUDED.payload,
-                    synced_at = EXCLUDED.synced_at
-            """,
-            rows,
+    # Create DataFrame from API response
+    new_df = spark.createDataFrame(rows).withColumn("synced_at", current_timestamp())
+
+    # Read existing article IDs to avoid duplicates
+    try:
+        existing_ids = (
+            spark.read.jdbc(url=jdbc_url, table=NEWS_TABLE_NAME, properties=jdbc_properties)
+            .select("id")
+            .distinct()
         )
+        # Filter out existing IDs
+        new_df = new_df.join(existing_ids, on="id", how="left_anti")
+    except Exception:
+        # Table might be empty or not exist yet - that's fine, write all rows
+        pass
+
+    # Write new records
+    if new_df.count() > 0:
+        new_df.write.jdbc(
+            url=jdbc_url, table=NEWS_TABLE_NAME, mode="append", properties=jdbc_properties
+        )
+        return new_df.count()
+    return 0
 
 
-ensure_news_table()
+print("NOTE: Before running this cell, ensure you've run sql/01_setup_news_table.sql")
+print("      to create the ticker_news_documents table in your Lakebase database.\n")
 
 tickers = get_watchlist_tickers()
 print(f"Found {len(tickers)} distinct watchlisted tickers: {tickers}")
@@ -376,12 +315,12 @@ for i, ticker in enumerate(tickers):
         time.sleep(_seconds_between_requests)
     try:
         articles = fetch_news_for_ticker(_massive_session, ticker, NEWS_FETCH_LIMIT)
+        news_synced += sync_news_to_spark(ticker, articles)
     except Exception as exc:
-        print(f"Skipping {ticker}: failed to fetch news ({exc})")
+        print(f"Skipping {ticker}: failed to fetch/sync news ({exc})")
         continue
-    news_synced += upsert_news_batch(ticker, articles)
 
-print(f"Synced {news_synced} news articles into {NEWS_TABLE_NAME} for {len(tickers)} tickers")
+print(f"Synced {news_synced} new news articles into {NEWS_TABLE_NAME} for {len(tickers)} tickers")
 
 # COMMAND ----------
 
@@ -460,9 +399,8 @@ def embed_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]
 
 
 embeddings_df = news_df.mapInPandas(embed_partitions, schema=embeddings_schema)
-embeddings_pdf = embeddings_df.toPandas()
 
-print(f"Computed {len(embeddings_pdf)} embeddings using {EMBEDDING_MODEL_NAME}")
+print(f"Computed {embeddings_df.count()} embeddings using {EMBEDDING_MODEL_NAME}")
 
 # COMMAND ----------
 
@@ -475,31 +413,12 @@ print(f"Computed {len(embeddings_pdf)} embeddings using {EMBEDDING_MODEL_NAME}")
 
 # COMMAND ----------
 
-with jdbc_connection() as conn:
-    execute_ddl(conn, "CREATE EXTENSION IF NOT EXISTS vector")
-    execute_ddl(
-        conn,
-        f"""
-        CREATE TABLE IF NOT EXISTS {EMBEDDINGS_TABLE_NAME} (
-            id TEXT PRIMARY KEY,
-            ticker TEXT NOT NULL,
-            title TEXT NOT NULL,
-            published_utc TIMESTAMPTZ,
-            embedding VECTOR({EMBEDDING_DIM}) NOT NULL,
-            model_name TEXT NOT NULL,
-            embedded_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        """,
-    )
-    # Approximate-nearest-neighbor index for fast cosine similarity search.
-    execute_ddl(
-        conn,
-        f"""
-        CREATE INDEX IF NOT EXISTS idx_{EMBEDDINGS_TABLE_NAME}_embedding
-        ON {EMBEDDINGS_TABLE_NAME}
-        USING hnsw (embedding vector_cosine_ops)
-        """,
-    )
+# Before running the cells below, ensure you've manually run:
+#   sql/02_setup_embeddings_table.sql
+# Replace {{EMBEDDING_DIM}} in that file with the value below:
+print(f"Required EMBEDDING_DIM for SQL setup: {EMBEDDING_DIM}")
+print(f"Table name: {EMBEDDINGS_TABLE_NAME}")
+print("\nRun sql/02_setup_embeddings_table.sql in your Lakebase database before continuing.")
 
 # COMMAND ----------
 
@@ -511,47 +430,49 @@ with jdbc_connection() as conn:
 
 # COMMAND ----------
 
-def _to_pgvector_literal(vector: list[float]) -> str:
-    """pgvector accepts vectors as a string literal like '[0.1,0.2,...]'."""
-    return "[" + ",".join(str(float(v)) for v in vector) + "]"
+from pyspark.sql.functions import current_timestamp, expr, lit
+from pyspark.sql.types import DoubleType
 
+# Add model_name and embedded_at columns
+embeddings_with_meta = embeddings_df.withColumn("model_name", lit(EMBEDDING_MODEL_NAME)).withColumn(
+    "embedded_at", current_timestamp()
+)
 
-rows = [
-    (
-        row["id"],
-        row["ticker"],
-        row["title"],
-        row["published_utc"],
-        _to_pgvector_literal(row["embedding"]),
-        EMBEDDING_MODEL_NAME,
+# Convert embedding array from ArrayType(FloatType) to ArrayType(DoubleType)
+# Postgres JDBC expects DOUBLE PRECISION[] for vector columns
+embeddings_final = embeddings_with_meta.withColumn(
+    "embedding", expr("transform(embedding, x -> cast(x as double))")
+)
+
+# Read existing embedding IDs to avoid duplicates (deduplication strategy)
+try:
+    existing_ids = (
+        spark.read.jdbc(url=jdbc_url, table=EMBEDDINGS_TABLE_NAME, properties=jdbc_properties)
+        .select("id")
+        .distinct()
     )
-    for _, row in embeddings_pdf.iterrows()
-]
+    # Filter out existing IDs (left anti-join keeps only new records)
+    new_embeddings = embeddings_final.join(existing_ids, on="id", how="left_anti")
+except Exception:
+    # Table might be empty or not exist - write all embeddings
+    new_embeddings = embeddings_final
 
-BATCH_SIZE = 500
-upserted = 0
-
-with jdbc_connection() as conn:
-    for start in range(0, len(rows), BATCH_SIZE):
-        batch = rows[start : start + BATCH_SIZE]
-        upserted += execute_batch(
-            conn,
-            f"""
-            INSERT INTO {EMBEDDINGS_TABLE_NAME}
-                (id, ticker, title, published_utc, embedding, model_name, embedded_at)
-            VALUES (?, ?, ?, ?::timestamptz, ?::vector, ?, now())
-            ON CONFLICT (id) DO UPDATE
-                SET ticker = EXCLUDED.ticker,
-                    title = EXCLUDED.title,
-                    published_utc = EXCLUDED.published_utc,
-                    embedding = EXCLUDED.embedding,
-                    model_name = EXCLUDED.model_name,
-                    embedded_at = EXCLUDED.embedded_at
-            """,
-            batch,
-        )
-
-print(f"Upserted {upserted} embeddings into {EMBEDDINGS_TABLE_NAME}")
+embedding_count = new_embeddings.count()
+if embedding_count > 0:
+    # NOTE: Spark JDBC does not natively support pgvector VECTOR type.
+    # The embeddings are written as DOUBLE PRECISION[] arrays.
+    # You'll need to manually cast them to VECTOR in a post-processing SQL step:
+    #   UPDATE ticker_news_embeddings 
+    #   SET embedding = embedding::vector 
+    #   WHERE embedding IS NOT NULL;
+    new_embeddings.write.jdbc(
+        url=jdbc_url, table=EMBEDDINGS_TABLE_NAME, mode="append", properties=jdbc_properties
+    )
+    print(f"Wrote {embedding_count} new embeddings to {EMBEDDINGS_TABLE_NAME}")
+    print("\nIMPORTANT: Run this SQL in your Lakebase database to cast arrays to vectors:")
+    print(f"  UPDATE {EMBEDDINGS_TABLE_NAME} SET embedding = embedding::vector;")
+else:
+    print("No new embeddings to write (all already exist).")
 
 # COMMAND ----------
 
@@ -629,10 +550,9 @@ def fetch_and_chunk_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.
 
 
 chunks_df = content_df.mapInPandas(fetch_and_chunk_partitions, schema=chunks_schema)
-chunks_pdf = chunks_df.toPandas()
 
-print(f"Extracted {len(chunks_pdf)} content chunks from {content_df.count()} article URLs")
-display(chunks_pdf.head(5))
+print(f"Extracted {chunks_df.count()} content chunks from {content_df.count()} article URLs")
+display(chunks_df.limit(5))
 
 # COMMAND ----------
 
@@ -644,16 +564,40 @@ display(chunks_pdf.head(5))
 
 # COMMAND ----------
 
-from sentence_transformers import SentenceTransformer
-
-_chunk_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-chunks_pdf["embedding"] = (
-    list(_chunk_model.encode(chunks_pdf["chunk_text"].tolist(), show_progress_bar=False))
-    if len(chunks_pdf)
-    else []
+chunk_embeddings_schema = StructType(
+    [
+        StructField("article_id", StringType(), False),
+        StructField("ticker", StringType(), False),
+        StructField("chunk_index", StringType(), False),
+        StructField("chunk_text", StringType(), False),
+        StructField("embedding", ArrayType(FloatType()), False),
+    ]
 )
 
-print(f"Computed {len(chunks_pdf)} chunk embeddings using {EMBEDDING_MODEL_NAME}")
+
+def embed_chunk_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
+    """Runs once per Spark partition: load the model once, then embed
+    every batch of chunks handed to this partition."""
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+    for batch in iterator:
+        vectors = model.encode(batch["chunk_text"].tolist(), show_progress_bar=False)
+        yield pd.DataFrame(
+            {
+                "article_id": batch["article_id"],
+                "ticker": batch["ticker"],
+                "chunk_index": batch["chunk_index"],
+                "chunk_text": batch["chunk_text"],
+                "embedding": [v.tolist() for v in vectors],
+            }
+        )
+
+
+chunk_embeddings_df = chunks_df.mapInPandas(embed_chunk_partitions, schema=chunk_embeddings_schema)
+
+print(f"Computed {chunk_embeddings_df.count()} chunk embeddings using {EMBEDDING_MODEL_NAME}")
 
 # COMMAND ----------
 
@@ -662,32 +606,12 @@ print(f"Computed {len(chunks_pdf)} chunk embeddings using {EMBEDDING_MODEL_NAME}
 
 # COMMAND ----------
 
-with jdbc_connection() as conn:
-    execute_ddl(conn, "CREATE EXTENSION IF NOT EXISTS vector")
-    execute_ddl(
-        conn,
-        f"""
-        CREATE TABLE IF NOT EXISTS {CHUNK_EMBEDDINGS_TABLE_NAME} (
-            id TEXT PRIMARY KEY,
-            article_id TEXT NOT NULL,
-            ticker TEXT NOT NULL,
-            chunk_index INT NOT NULL,
-            chunk_text TEXT NOT NULL,
-            embedding VECTOR({EMBEDDING_DIM}) NOT NULL,
-            model_name TEXT NOT NULL,
-            embedded_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        """,
-    )
-    # Approximate-nearest-neighbor index for fast cosine similarity search.
-    execute_ddl(
-        conn,
-        f"""
-        CREATE INDEX IF NOT EXISTS idx_{CHUNK_EMBEDDINGS_TABLE_NAME}_embedding
-        ON {CHUNK_EMBEDDINGS_TABLE_NAME}
-        USING hnsw (embedding vector_cosine_ops)
-        """,
-    )
+# Before running the cells below, ensure you've manually run:
+#   sql/03_setup_chunk_embeddings_table.sql
+# Replace {{EMBEDDING_DIM}} in that file with the value below:
+print(f"Required EMBEDDING_DIM for SQL setup: {EMBEDDING_DIM}")
+print(f"Table name: {CHUNK_EMBEDDINGS_TABLE_NAME}")
+print("\nRun sql/03_setup_chunk_embeddings_table.sql in your Lakebase database before continuing.")
 
 # COMMAND ----------
 
@@ -696,41 +620,48 @@ with jdbc_connection() as conn:
 
 # COMMAND ----------
 
-chunk_rows = [
-    (
-        f"{row['article_id']}_{row['chunk_index']}",
-        row["article_id"],
-        row["ticker"],
-        int(row["chunk_index"]),
-        row["chunk_text"],
-        _to_pgvector_literal(row["embedding"]),
-        EMBEDDING_MODEL_NAME,
+# Add id (article_id_chunk_index), model_name, and embedded_at columns
+chunk_embeddings_with_meta = (
+    chunk_embeddings_df.withColumn(
+        "id", expr("concat(article_id, '_', chunk_index)")
     )
-    for _, row in chunks_pdf.iterrows()
-]
+    .withColumn("model_name", lit(EMBEDDING_MODEL_NAME))
+    .withColumn("embedded_at", current_timestamp())
+    .withColumn("chunk_index", col("chunk_index").cast("int"))
+)
 
-chunk_upserted = 0
+# Convert embedding array from ArrayType(FloatType) to ArrayType(DoubleType)
+# Postgres JDBC expects DOUBLE PRECISION[] for vector columns
+chunk_embeddings_final = chunk_embeddings_with_meta.withColumn(
+    "embedding", expr("transform(embedding, x -> cast(x as double))")
+)
 
-with jdbc_connection() as conn:
-    for start in range(0, len(chunk_rows), BATCH_SIZE):
-        batch = chunk_rows[start : start + BATCH_SIZE]
-        chunk_upserted += execute_batch(
-            conn,
-            f"""
-            INSERT INTO {CHUNK_EMBEDDINGS_TABLE_NAME}
-                (id, article_id, ticker, chunk_index, chunk_text, embedding, model_name, embedded_at)
-            VALUES (?, ?, ?, ?, ?, ?::vector, ?, now())
-            ON CONFLICT (id) DO UPDATE
-                SET article_id = EXCLUDED.article_id,
-                    ticker = EXCLUDED.ticker,
-                    chunk_index = EXCLUDED.chunk_index,
-                    chunk_text = EXCLUDED.chunk_text,
-                    embedding = EXCLUDED.embedding,
-                    model_name = EXCLUDED.model_name,
-                    embedded_at = EXCLUDED.embedded_at
-            """,
-            batch,
-        )
+# Read existing chunk embedding IDs to avoid duplicates (deduplication strategy)
+try:
+    existing_ids = (
+        spark.read.jdbc(url=jdbc_url, table=CHUNK_EMBEDDINGS_TABLE_NAME, properties=jdbc_properties)
+        .select("id")
+        .distinct()
+    )
+    # Filter out existing IDs (left anti-join keeps only new records)
+    new_chunk_embeddings = chunk_embeddings_final.join(existing_ids, on="id", how="left_anti")
+except Exception:
+    # Table might be empty or not exist - write all chunk embeddings
+    new_chunk_embeddings = chunk_embeddings_final
 
-print(f"Upserted {chunk_upserted} chunk embeddings into {CHUNK_EMBEDDINGS_TABLE_NAME}")
-
+chunk_count = new_chunk_embeddings.count()
+if chunk_count > 0:
+    # NOTE: Spark JDBC does not natively support pgvector VECTOR type.
+    # The embeddings are written as DOUBLE PRECISION[] arrays.
+    # You'll need to manually cast them to VECTOR in a post-processing SQL step:
+    #   UPDATE ticker_news_chunk_embeddings 
+    #   SET embedding = embedding::vector 
+    #   WHERE embedding IS NOT NULL;
+    new_chunk_embeddings.write.jdbc(
+        url=jdbc_url, table=CHUNK_EMBEDDINGS_TABLE_NAME, mode="append", properties=jdbc_properties
+    )
+    print(f"Wrote {chunk_count} new chunk embeddings to {CHUNK_EMBEDDINGS_TABLE_NAME}")
+    print("\nIMPORTANT: Run this SQL in your Lakebase database to cast arrays to vectors:")
+    print(f"  UPDATE {CHUNK_EMBEDDINGS_TABLE_NAME} SET embedding = embedding::vector;")
+else:
+    print("No new chunk embeddings to write (all already exist).")
