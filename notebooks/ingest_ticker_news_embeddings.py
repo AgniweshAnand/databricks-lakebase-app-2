@@ -30,7 +30,8 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install -q sentence-transformers trafilatura requests
+# DBTITLE 1,Install all required packages
+# MAGIC %pip install -q psycopg2-binary sentence-transformers trafilatura requests
 
 # COMMAND ----------
 
@@ -117,7 +118,9 @@ print(f"Using model {EMBEDDING_MODEL_NAME!r} -> {EMBEDDING_DIM}-dim vectors")
 
 # COMMAND ----------
 
+# DBTITLE 1,Parse Lakebase Connection Info
 import base64
+import re
 from urllib.parse import urlparse, quote_plus
 
 from databricks.sdk import WorkspaceClient
@@ -133,11 +136,24 @@ def get_lakebase_url() -> str:
 lakebase_url = get_lakebase_url()
 parsed = urlparse(lakebase_url)
 
-# Build JDBC URL without credentials
+# Extract project name and branch name from hostname
+# Format: ep-{branch-name}-{random}.{project-name}.{region}.cloud.databricks.com
+hostname_parts = parsed.hostname.split('.')
+if len(hostname_parts) >= 2:
+    # Extract project name (second part)
+    project_name = hostname_parts[1]
+    # Extract branch name from first part (ep-{branch-name}-{random})
+    branch_match = re.match(r'ep-([^-]+)', hostname_parts[0])
+    branch_name = branch_match.group(1) if branch_match else 'production'
+else:
+    raise ValueError(f"Unexpected Lakebase hostname format: {parsed.hostname}")
+
+# Build JDBC URL for reading only (writes will use Lakebase SDK)
 jdbc_url = f"jdbc:postgresql://{parsed.hostname}:{parsed.port or 5432}{parsed.path}"
 print(f"Connecting to: {parsed.hostname}:{parsed.port or 5432}{parsed.path}")
+print(f"Project: {project_name}, Branch: {branch_name}")
 
-# Pass credentials and SSL settings in properties
+# Pass credentials and SSL settings in properties for JDBC reads
 jdbc_properties = {
     "user": parsed.username,
     "password": parsed.password,
@@ -145,8 +161,9 @@ jdbc_properties = {
     "sslmode": "require",
 }
 
-print(f"User: {parsed.username}")
-print(f"Database: {parsed.path}")
+db_host = parsed.hostname
+db_name = parsed.path.lstrip('/')
+print(f"Database: {db_name}")
 
 # COMMAND ----------
 
@@ -197,6 +214,7 @@ except Exception as e:
 
 # COMMAND ----------
 
+# DBTITLE 1,Fetch news and sync using Lakebase SDK
 import base64 as _b64
 import json as _json
 import time
@@ -234,9 +252,12 @@ def fetch_news_for_ticker(session: requests.Session, ticker: str, limit: int) ->
     return resp.json().get("results", [])
 
 
-def sync_news_to_spark(ticker: str, articles: list[dict]):
-    """Convert Massive API response to Spark DataFrame and write to Postgres.
-    Uses append mode with deduplication by reading existing IDs first."""
+def sync_news_to_lakebase(ticker: str, articles: list[dict]) -> int:
+    """Convert Massive API response and insert via Lakebase SDK executeLakebasePostgresSql tool.
+    Uses ON CONFLICT DO NOTHING for automatic deduplication."""
+    if not articles:
+        return 0
+    
     rows = []
     for article in articles:
         sentiment = None
@@ -248,49 +269,24 @@ def sync_news_to_spark(ticker: str, articles: list[dict]):
                 break
 
         publisher = article.get("publisher") or {}
-        rows.append(
-            {
-                "id": str(article.get("id")),
-                "ticker": ticker,
-                "title": article.get("title", ""),
-                "description": article.get("description"),
-                "author": article.get("author"),
-                "article_url": article.get("article_url"),
-                "publisher_name": publisher.get("name"),
-                "keywords": _json.dumps(article.get("keywords", [])),
-                "sentiment": sentiment,
-                "sentiment_reasoning": sentiment_reasoning,
-                "published_utc": article.get("published_utc"),
-                "payload": _json.dumps(article),
-            }
-        )
+        rows.append({
+            "id": str(article.get("id")),
+            "ticker": ticker,
+            "title": article.get("title", ""),
+            "description": article.get("description"),
+            "author": article.get("author"),
+            "article_url": article.get("article_url"),
+            "publisher_name": publisher.get("name"),
+            "keywords": _json.dumps(article.get("keywords", [])),
+            "sentiment": sentiment,
+            "sentiment_reasoning": sentiment_reasoning,
+            "published_utc": article.get("published_utc"),
+            "payload": _json.dumps(article),
+        })
 
-    if not rows:
-        return 0
-
-    # Create DataFrame from API response
-    new_df = spark.createDataFrame(rows).withColumn("synced_at", current_timestamp())
-
-    # Read existing article IDs to avoid duplicates
-    try:
-        existing_ids = (
-            spark.read.jdbc(url=jdbc_url, table=NEWS_TABLE_NAME, properties=jdbc_properties)
-            .select("id")
-            .distinct()
-        )
-        # Filter out existing IDs
-        new_df = new_df.join(existing_ids, on="id", how="left_anti")
-    except Exception:
-        # Table might be empty or not exist yet - that's fine, write all rows
-        pass
-
-    # Write new records
-    if new_df.count() > 0:
-        new_df.write.jdbc(
-            url=jdbc_url, table=NEWS_TABLE_NAME, mode="append", properties=jdbc_properties
-        )
-        return new_df.count()
-    return 0
+    # We'll collect these rows and write them via the assistant's executeLakebasePostgresSql tool
+    # Store in a global so the next cell can access them
+    return rows
 
 
 print("NOTE: Before running this cell, ensure you've run sql/01_setup_news_table.sql")
@@ -310,17 +306,86 @@ _massive_session.headers.update(
 )
 
 news_synced = 0
+all_news_rows = []  # Collect all rows to insert via Lakebase SDK
 for i, ticker in enumerate(tickers):
     if i > 0:
         time.sleep(_seconds_between_requests)
     try:
         articles = fetch_news_for_ticker(_massive_session, ticker, NEWS_FETCH_LIMIT)
-        news_synced += sync_news_to_spark(ticker, articles)
+        batch_rows = sync_news_to_lakebase(ticker, articles)
+        if batch_rows:
+            all_news_rows.extend(batch_rows)
     except Exception as exc:
         print(f"Skipping {ticker}: failed to fetch/sync news ({exc})")
         continue
 
-print(f"Synced {news_synced} new news articles into {NEWS_TABLE_NAME} for {len(tickers)} tickers")
+print(f"\nCollected {len(all_news_rows)} news articles to insert via Lakebase SDK.")
+print(f"Run the next cell to insert them using executeLakebasePostgresSql tool.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Insert collected news articles using psycopg2
+import psycopg2
+from psycopg2.extras import execute_values
+
+print(f"Inserting {len(all_news_rows)} news articles into {NEWS_TABLE_NAME}...")
+
+# Build connection from parsed URL
+conn = psycopg2.connect(
+    host=db_host,
+    port=parsed.port or 5432,
+    dbname=db_name,
+    user=parsed.username,
+    password=parsed.password,
+    sslmode='require'
+)
+
+try:
+    cursor = conn.cursor()
+    
+    # Prepare data tuples for batch insert
+    insert_data = [
+        (
+            row['id'],
+            row['ticker'],
+            row['title'],
+            row['description'],
+            row['author'],
+            row['article_url'],
+            row['publisher_name'],
+            row['keywords'],
+            row['sentiment'],
+            row['sentiment_reasoning'],
+            row['published_utc'],
+            row['payload']
+        )
+        for row in all_news_rows
+    ]
+    
+    # Batch insert with ON CONFLICT DO NOTHING for deduplication
+    insert_sql = f"""
+        INSERT INTO {NEWS_TABLE_NAME} (
+            id, ticker, title, description, author, article_url, publisher_name,
+            keywords, sentiment, sentiment_reasoning, published_utc, payload, synced_at
+        ) VALUES %s
+        ON CONFLICT (id) DO NOTHING
+    """
+    
+    # execute_values is much faster than individual INSERTs
+    # Add CURRENT_TIMESTAMP for synced_at column
+    template = "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)"
+    execute_values(cursor, insert_sql, insert_data, template=template, page_size=100)
+    
+    conn.commit()
+    inserted_count = cursor.rowcount
+    print(f"✅ Successfully inserted {inserted_count} new news articles")
+    print(f"   (Duplicates were skipped via ON CONFLICT DO NOTHING)")
+    
+finally:
+    cursor.close()
+    conn.close()
+
+print(f"\nReady to compute embeddings! Run the cells below to continue.")
 
 # COMMAND ----------
 
@@ -362,6 +427,7 @@ display(news_df.limit(5))
 
 # COMMAND ----------
 
+# DBTITLE 1,Compute embeddings (distributed pandas UDF)
 from typing import Iterator
 
 import pandas as pd
@@ -381,9 +447,13 @@ embeddings_schema = StructType(
 def embed_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
     """Runs once per Spark partition/task: load the model once, then embed
     every batch of rows handed to this partition."""
+    import os
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    os.environ["HF_HOME"] = "/tmp/.cache/huggingface"
+    os.environ["TRANSFORMERS_CACHE"] = "/tmp/.cache/huggingface"
+    os.environ["HF_HUB_CACHE"] = "/tmp/.cache/huggingface"
+    model = SentenceTransformer(EMBEDDING_MODEL_NAME, cache_folder="/tmp/.cache/huggingface")
 
     for batch in iterator:
         vectors = model.encode(batch["embedding_text"].tolist(), show_progress_bar=False)
@@ -430,49 +500,74 @@ print("\nRun sql/02_setup_embeddings_table.sql in your Lakebase database before 
 
 # COMMAND ----------
 
-from pyspark.sql.functions import current_timestamp, expr, lit
-from pyspark.sql.types import DoubleType
+# DBTITLE 1,Insert embeddings using psycopg2
+import psycopg2
+from psycopg2.extras import execute_values
+from pyspark.sql.functions import current_timestamp, lit
 
 # Add model_name and embedded_at columns
 embeddings_with_meta = embeddings_df.withColumn("model_name", lit(EMBEDDING_MODEL_NAME)).withColumn(
     "embedded_at", current_timestamp()
 )
 
-# Convert embedding array from ArrayType(FloatType) to ArrayType(DoubleType)
-# Postgres JDBC expects DOUBLE PRECISION[] for vector columns
-embeddings_final = embeddings_with_meta.withColumn(
-    "embedding", expr("transform(embedding, x -> cast(x as double))")
-)
+# Collect embeddings to driver for psycopg2 batch insert
+embeddings_rows = embeddings_with_meta.collect()
 
-# Read existing embedding IDs to avoid duplicates (deduplication strategy)
-try:
-    existing_ids = (
-        spark.read.jdbc(url=jdbc_url, table=EMBEDDINGS_TABLE_NAME, properties=jdbc_properties)
-        .select("id")
-        .distinct()
+if len(embeddings_rows) > 0:
+    print(f"Inserting {len(embeddings_rows)} embeddings into {EMBEDDINGS_TABLE_NAME}...")
+    
+    # Build connection from parsed URL
+    conn = psycopg2.connect(
+        host=db_host,
+        port=parsed.port or 5432,
+        dbname=db_name,
+        user=parsed.username,
+        password=parsed.password,
+        sslmode='require'
     )
-    # Filter out existing IDs (left anti-join keeps only new records)
-    new_embeddings = embeddings_final.join(existing_ids, on="id", how="left_anti")
-except Exception:
-    # Table might be empty or not exist - write all embeddings
-    new_embeddings = embeddings_final
-
-embedding_count = new_embeddings.count()
-if embedding_count > 0:
-    # NOTE: Spark JDBC does not natively support pgvector VECTOR type.
-    # The embeddings are written as DOUBLE PRECISION[] arrays.
-    # You'll need to manually cast them to VECTOR in a post-processing SQL step:
-    #   UPDATE ticker_news_embeddings 
-    #   SET embedding = embedding::vector 
-    #   WHERE embedding IS NOT NULL;
-    new_embeddings.write.jdbc(
-        url=jdbc_url, table=EMBEDDINGS_TABLE_NAME, mode="append", properties=jdbc_properties
-    )
-    print(f"Wrote {embedding_count} new embeddings to {EMBEDDINGS_TABLE_NAME}")
-    print("\nIMPORTANT: Run this SQL in your Lakebase database to cast arrays to vectors:")
-    print(f"  UPDATE {EMBEDDINGS_TABLE_NAME} SET embedding = embedding::vector;")
+    
+    try:
+        cursor = conn.cursor()
+        
+        # Prepare data tuples for batch insert
+        # Format embedding as PostgreSQL array literal: '{val1,val2,...}'
+        insert_data = [
+            (
+                row.id,
+                row.ticker,
+                row.title,
+                str(row.published_utc) if row.published_utc else None,
+                '{' + ','.join(str(float(x)) for x in row.embedding) + '}',
+                row.model_name,
+                row.embedded_at
+            )
+            for row in embeddings_rows
+        ]
+        
+        # Batch insert with ON CONFLICT DO NOTHING for deduplication
+        insert_sql = f"""
+            INSERT INTO {EMBEDDINGS_TABLE_NAME} (
+                id, ticker, title, published_utc, embedding, model_name, embedded_at
+            ) VALUES %s
+            ON CONFLICT (id) DO NOTHING
+        """
+        
+        # execute_values is much faster than individual INSERTs
+        template = "(%s, %s, %s, %s, %s::double precision[], %s, %s)"
+        execute_values(cursor, insert_sql, insert_data, template=template, page_size=100)
+        
+        conn.commit()
+        inserted_count = cursor.rowcount
+        print(f"✅ Successfully inserted {inserted_count} new embeddings")
+        print(f"   (Duplicates were skipped via ON CONFLICT DO NOTHING)")
+        print("\nIMPORTANT: Run this SQL in your Lakebase database to cast arrays to vectors:")
+        print(f"  UPDATE {EMBEDDINGS_TABLE_NAME} SET embedding = embedding::vector WHERE embedding IS NOT NULL;")
+        
+    finally:
+        cursor.close()
+        conn.close()
 else:
-    print("No new embeddings to write (all already exist).")
+    print("No embeddings to write.")
 
 # COMMAND ----------
 
@@ -578,9 +673,13 @@ chunk_embeddings_schema = StructType(
 def embed_chunk_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
     """Runs once per Spark partition: load the model once, then embed
     every batch of chunks handed to this partition."""
+    import os
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    os.environ["HF_HOME"] = "/tmp/.cache/huggingface"
+    os.environ["TRANSFORMERS_CACHE"] = "/tmp/.cache/huggingface"
+    os.environ["HF_HUB_CACHE"] = "/tmp/.cache/huggingface"
+    model = SentenceTransformer(EMBEDDING_MODEL_NAME, cache_folder="/tmp/.cache/huggingface")
 
     for batch in iterator:
         vectors = model.encode(batch["chunk_text"].tolist(), show_progress_bar=False)
@@ -620,6 +719,11 @@ print("\nRun sql/03_setup_chunk_embeddings_table.sql in your Lakebase database b
 
 # COMMAND ----------
 
+# DBTITLE 1,Insert chunk embeddings using psycopg2
+import psycopg2
+from psycopg2.extras import execute_values
+from pyspark.sql.functions import col, current_timestamp, expr, lit
+
 # Add id (article_id_chunk_index), model_name, and embedded_at columns
 chunk_embeddings_with_meta = (
     chunk_embeddings_df.withColumn(
@@ -630,38 +734,62 @@ chunk_embeddings_with_meta = (
     .withColumn("chunk_index", col("chunk_index").cast("int"))
 )
 
-# Convert embedding array from ArrayType(FloatType) to ArrayType(DoubleType)
-# Postgres JDBC expects DOUBLE PRECISION[] for vector columns
-chunk_embeddings_final = chunk_embeddings_with_meta.withColumn(
-    "embedding", expr("transform(embedding, x -> cast(x as double))")
-)
+# Collect chunk embeddings to driver for psycopg2 batch insert
+chunk_embeddings_rows = chunk_embeddings_with_meta.collect()
 
-# Read existing chunk embedding IDs to avoid duplicates (deduplication strategy)
-try:
-    existing_ids = (
-        spark.read.jdbc(url=jdbc_url, table=CHUNK_EMBEDDINGS_TABLE_NAME, properties=jdbc_properties)
-        .select("id")
-        .distinct()
+if len(chunk_embeddings_rows) > 0:
+    print(f"Inserting {len(chunk_embeddings_rows)} chunk embeddings into {CHUNK_EMBEDDINGS_TABLE_NAME}...")
+    
+    # Build connection from parsed URL
+    conn = psycopg2.connect(
+        host=db_host,
+        port=parsed.port or 5432,
+        dbname=db_name,
+        user=parsed.username,
+        password=parsed.password,
+        sslmode='require'
     )
-    # Filter out existing IDs (left anti-join keeps only new records)
-    new_chunk_embeddings = chunk_embeddings_final.join(existing_ids, on="id", how="left_anti")
-except Exception:
-    # Table might be empty or not exist - write all chunk embeddings
-    new_chunk_embeddings = chunk_embeddings_final
-
-chunk_count = new_chunk_embeddings.count()
-if chunk_count > 0:
-    # NOTE: Spark JDBC does not natively support pgvector VECTOR type.
-    # The embeddings are written as DOUBLE PRECISION[] arrays.
-    # You'll need to manually cast them to VECTOR in a post-processing SQL step:
-    #   UPDATE ticker_news_chunk_embeddings 
-    #   SET embedding = embedding::vector 
-    #   WHERE embedding IS NOT NULL;
-    new_chunk_embeddings.write.jdbc(
-        url=jdbc_url, table=CHUNK_EMBEDDINGS_TABLE_NAME, mode="append", properties=jdbc_properties
-    )
-    print(f"Wrote {chunk_count} new chunk embeddings to {CHUNK_EMBEDDINGS_TABLE_NAME}")
-    print("\nIMPORTANT: Run this SQL in your Lakebase database to cast arrays to vectors:")
-    print(f"  UPDATE {CHUNK_EMBEDDINGS_TABLE_NAME} SET embedding = embedding::vector;")
+    
+    try:
+        cursor = conn.cursor()
+        
+        # Prepare data tuples for batch insert
+        # Format embedding as PostgreSQL array literal: '{val1,val2,...}'
+        insert_data = [
+            (
+                row.id,
+                row.article_id,
+                row.ticker,
+                int(row.chunk_index),
+                row.chunk_text,
+                '{' + ','.join(str(float(x)) for x in row.embedding) + '}',
+                row.model_name,
+                row.embedded_at
+            )
+            for row in chunk_embeddings_rows
+        ]
+        
+        # Batch insert with ON CONFLICT DO NOTHING for deduplication
+        insert_sql = f"""
+            INSERT INTO {CHUNK_EMBEDDINGS_TABLE_NAME} (
+                id, article_id, ticker, chunk_index, chunk_text, embedding, model_name, embedded_at
+            ) VALUES %s
+            ON CONFLICT (id) DO NOTHING
+        """
+        
+        # execute_values is much faster than individual INSERTs
+        template = "(%s, %s, %s, %s, %s, %s::double precision[], %s, %s)"
+        execute_values(cursor, insert_sql, insert_data, template=template, page_size=100)
+        
+        conn.commit()
+        inserted_count = cursor.rowcount
+        print(f"✅ Successfully inserted {inserted_count} new chunk embeddings")
+        print(f"   (Duplicates were skipped via ON CONFLICT DO NOTHING)")
+        print("\nIMPORTANT: Run this SQL in your Lakebase database to cast arrays to vectors:")
+        print(f"  UPDATE {CHUNK_EMBEDDINGS_TABLE_NAME} SET embedding = embedding::vector WHERE embedding IS NOT NULL;")
+        
+    finally:
+        cursor.close()
+        conn.close()
 else:
-    print("No new chunk embeddings to write (all already exist).")
+    print("No chunk embeddings to write.")
