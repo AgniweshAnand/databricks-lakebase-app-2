@@ -31,7 +31,8 @@
 # COMMAND ----------
 
 # DBTITLE 1,Install all required packages
-# MAGIC %pip install -q psycopg2-binary sentence-transformers trafilatura requests
+# MAGIC %pip uninstall -y psycopg2 psycopg2-binary
+# MAGIC %pip install -q 'databricks-sdk>=0.118.0' sentence-transformers trafilatura requests pandas
 
 # COMMAND ----------
 
@@ -112,16 +113,14 @@ print(f"Using model {EMBEDDING_MODEL_NAME!r} -> {EMBEDDING_DIM}-dim vectors")
 # MAGIC
 # MAGIC Same secret, same decoding scheme as `lakebase.py`: a single base64-encoded
 # MAGIC Postgres URL (`postgresql://role:password@host:5432/db?sslmode=require`)
-# MAGIC stored in a Databricks secret scope. We parse it into the pieces both
-# MAGIC Spark's JDBC reader AND the raw JDBC connection helper below need
-# MAGIC (url/user/password).
+# MAGIC stored in a Databricks secret scope. We parse it into the pieces psycopg3
+# MAGIC needs for connection (host/port/dbname/user/password).
 
 # COMMAND ----------
 
 # DBTITLE 1,Parse Lakebase Connection Info
 import base64
-import re
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse
 
 from databricks.sdk import WorkspaceClient
 
@@ -136,50 +135,58 @@ def get_lakebase_url() -> str:
 lakebase_url = get_lakebase_url()
 parsed = urlparse(lakebase_url)
 
-# Extract project name and branch name from hostname
-# Format: ep-{branch-name}-{random}.{project-name}.{region}.cloud.databricks.com
-hostname_parts = parsed.hostname.split('.')
-if len(hostname_parts) >= 2:
-    # Extract project name (second part)
-    project_name = hostname_parts[1]
-    # Extract branch name from first part (ep-{branch-name}-{random})
-    branch_match = re.match(r'ep-([^-]+)', hostname_parts[0])
-    branch_name = branch_match.group(1) if branch_match else 'production'
-else:
-    raise ValueError(f"Unexpected Lakebase hostname format: {parsed.hostname}")
-
-# Build JDBC URL for reading only (writes will use Lakebase SDK)
-jdbc_url = f"jdbc:postgresql://{parsed.hostname}:{parsed.port or 5432}{parsed.path}"
-print(f"Connecting to: {parsed.hostname}:{parsed.port or 5432}{parsed.path}")
-print(f"Project: {project_name}, Branch: {branch_name}")
-
-# Pass credentials and SSL settings in properties for JDBC reads
-jdbc_properties = {
-    "user": parsed.username,
-    "password": parsed.password,
-    "driver": "org.postgresql.Driver",
-    "sslmode": "require",
-}
-
+# Extract connection details directly from the secret URL
 db_host = parsed.hostname
+db_port = parsed.port or 5432
 db_name = parsed.path.lstrip('/')
-print(f"Database: {db_name}")
+db_user = parsed.username
+db_password = parsed.password
+
+print(f"Connection details:")
+print(f"  Host: {db_host}:{db_port}")
+print(f"  Database: {db_name}")
+print(f"  User: {db_user}")
+print(f"  Using raw credentials from secret (no OAuth)")
 
 # COMMAND ----------
 
-# DBTITLE 1,Test JDBC Connection
-# Test JDBC connection with embedded credentials
+# DBTITLE 1,Test Psycopg2 connection
+import psycopg2
+
+print(f"Testing connection to {db_host}:{db_port}/{db_name}")
+print(f"Using OAuth token authentication as user: {db_user}\n")
+
+# Test psycopg3 connection with OAuth token
 try:
-    test_df = spark.read.jdbc(
-        url=jdbc_url,
-        table=WATCHLIST_TABLE_NAME,
-        properties=jdbc_properties
+    conn = psycopg2.connect(
+        host=db_host,
+        port=db_port,
+        dbname=db_name,
+        user=db_user,
+        password=db_password,
+        sslmode='require',
+        connect_timeout=10
     )
-    count = test_df.count()
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT COUNT(*) FROM {WATCHLIST_TABLE_NAME}")
+    count = cursor.fetchone()[0]
     print(f"✅ Connection successful! Found {count} rows in {WATCHLIST_TABLE_NAME}")
-    test_df.show(5)
+    
+    cursor.execute(f"SELECT * FROM {WATCHLIST_TABLE_NAME} LIMIT 5")
+    rows = cursor.fetchall()
+    colnames = [desc[0] for desc in cursor.description]
+    print(f"\nColumns: {colnames}")
+    for row in rows:
+        print(row)
+    
+    cursor.close()
+    conn.close()
+    print("\n✅ psycopg3 with OAuth authentication working correctly!")
 except Exception as e:
+    import traceback
     print(f"❌ Connection failed: {e}")
+    print(f"\nFull traceback:")
+    traceback.print_exc()
 
 # COMMAND ----------
 
@@ -195,7 +202,7 @@ except Exception as e:
 # MAGIC 3. Run `sql/03_setup_chunk_embeddings_table.sql` to create `ticker_news_chunk_embeddings`
 # MAGIC    - Replace `{{EMBEDDING_DIM}}` with your model's dimension (e.g., 384)
 # MAGIC
-# MAGIC This notebook uses Spark JDBC for all database operations - no psycopg2 required.
+# MAGIC This notebook uses psycopg2 with OAuth token authentication for all database operations.
 
 # COMMAND ----------
 
@@ -220,9 +227,8 @@ import json as _json
 import time
 from datetime import datetime
 
+import psycopg2
 import requests
-from pyspark.sql.functions import col, current_timestamp, lit
-from pyspark.sql.types import StringType, StructField, StructType
 
 
 def get_massive_api_key() -> str:
@@ -233,11 +239,22 @@ def get_massive_api_key() -> str:
 def get_watchlist_tickers() -> list[str]:
     """Distinct, uppercased ticker symbols currently tracked across all users
     in the watchlist table - these are the only tickers we fetch news for."""
-    watchlist_df = spark.read.jdbc(
-        url=jdbc_url, table=WATCHLIST_TABLE_NAME, properties=jdbc_properties
+    conn = psycopg2.connect(
+        host=db_host,
+        port=db_port,
+        dbname=db_name,
+        user=db_user,
+        password=db_password,
+        sslmode='require'
     )
-    symbols = watchlist_df.select("symbol").distinct().collect()
-    return [row.symbol.strip().upper() for row in symbols if row.symbol]
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT DISTINCT symbol FROM {WATCHLIST_TABLE_NAME} WHERE symbol IS NOT NULL")
+        symbols = cursor.fetchall()
+        return [row[0].strip().upper() for row in symbols if row[0]]
+    finally:
+        cursor.close()
+        conn.close()
 
 
 def fetch_news_for_ticker(session: requests.Session, ticker: str, limit: int) -> list[dict]:
@@ -326,17 +343,14 @@ print(f"Run the next cell to insert them using executeLakebasePostgresSql tool."
 
 # DBTITLE 1,Insert collected news articles using psycopg2
 import psycopg2
-from psycopg2.extras import execute_values
 
-print(f"Inserting {len(all_news_rows)} news articles into {NEWS_TABLE_NAME}...")
-
-# Build connection from parsed URL
+# Build connection using psycopg2
 conn = psycopg2.connect(
     host=db_host,
-    port=parsed.port or 5432,
+    port=db_port,
     dbname=db_name,
-    user=parsed.username,
-    password=parsed.password,
+    user=db_user,
+    password=db_password,
     sslmode='require'
 )
 
@@ -367,14 +381,12 @@ try:
         INSERT INTO {NEWS_TABLE_NAME} (
             id, ticker, title, description, author, article_url, publisher_name,
             keywords, sentiment, sentiment_reasoning, published_utc, payload, synced_at
-        ) VALUES %s
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
         ON CONFLICT (id) DO NOTHING
     """
     
-    # execute_values is much faster than individual INSERTs
-    # Add CURRENT_TIMESTAMP for synced_at column
-    template = "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)"
-    execute_values(cursor, insert_sql, insert_data, template=template, page_size=100)
+    # executemany in psycopg3 is much faster than individual INSERTs
+    cursor.executemany(insert_sql, insert_data)
     
     conn.commit()
     inserted_count = cursor.rowcount
@@ -390,96 +402,101 @@ print(f"\nReady to compute embeddings! Run the cells below to continue.")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Load raw news documents with Spark
+# MAGIC ## Load raw news documents
 # MAGIC
 # MAGIC Reads the whole `ticker_news_documents` table (just synced from Massive
-# MAGIC above) via JDBC into a Spark DataFrame so embedding computation can be
-# MAGIC distributed across the cluster.
+# MAGIC above) using psycopg3 into a pandas DataFrame for embedding computation.
 
 # COMMAND ----------
 
-news_df = (
-    spark.read.jdbc(url=jdbc_url, table=NEWS_TABLE_NAME, properties=jdbc_properties)
-    .selectExpr(
-        "id",
-        "ticker",
-        "title",
-        "description",
-        "article_url",
-        "published_utc",
-        # Embed on title + description together for richer context.
-        "trim(concat(coalesce(title, ''), '. ', coalesce(description, ''))) AS embedding_text",
-    )
-    .filter("embedding_text IS NOT NULL AND embedding_text != ''")
+import pandas as pd
+import psycopg2
+
+# Load news documents using psycopg2
+conn = psycopg2.connect(
+    host=db_host,
+    port=db_port,
+    dbname=db_name,
+    user=db_user,
+    password=db_password,
+    sslmode='require'
 )
 
-print(f"Loaded {news_df.count()} news documents from {NEWS_TABLE_NAME}")
-display(news_df.limit(5))
+try:
+    # Query with embedding_text computed
+    query = f"""
+        SELECT 
+            id,
+            ticker,
+            title,
+            description,
+            article_url,
+            published_utc,
+            TRIM(CONCAT(COALESCE(title, ''), '. ', COALESCE(description, ''))) AS embedding_text
+        FROM {NEWS_TABLE_NAME}
+        WHERE TRIM(CONCAT(COALESCE(title, ''), '. ', COALESCE(description, ''))) IS NOT NULL
+          AND TRIM(CONCAT(COALESCE(title, ''), '. ', COALESCE(description, ''))) != ''
+    """
+    
+    news_df = pd.read_sql_query(query, conn)
+    print(f"Loaded {len(news_df)} news documents from {NEWS_TABLE_NAME}")
+    display(news_df.head(5))
+finally:
+    conn.close()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Compute embeddings (distributed pandas UDF)
+# MAGIC ## Compute embeddings
 # MAGIC
-# MAGIC Loads the sentence-transformers model once per executor process (not per
-# MAGIC row) and applies it in batches via `mapInPandas`, which scales across
-# MAGIC however many workers the cluster has.
+# MAGIC Loads the sentence-transformers model once and applies it in batches
+# MAGIC to the news documents.
 
 # COMMAND ----------
 
 # DBTITLE 1,Compute embeddings (distributed pandas UDF)
-from typing import Iterator
-
+import os
 import pandas as pd
-from pyspark.sql.types import ArrayType, FloatType, StringType, StructField, StructType
+from sentence_transformers import SentenceTransformer
 
-embeddings_schema = StructType(
-    [
-        StructField("id", StringType(), False),
-        StructField("ticker", StringType(), False),
-        StructField("title", StringType(), False),
-        StructField("published_utc", StringType(), True),
-        StructField("embedding", ArrayType(FloatType()), False),
-    ]
-)
+# Set up HuggingFace cache
+os.environ["HF_HOME"] = "/tmp/.cache/huggingface"
+os.environ["TRANSFORMERS_CACHE"] = "/tmp/.cache/huggingface"
+os.environ["HF_HUB_CACHE"] = "/tmp/.cache/huggingface"
 
+print(f"Loading embedding model {EMBEDDING_MODEL_NAME}...")
+model = SentenceTransformer(EMBEDDING_MODEL_NAME, cache_folder="/tmp/.cache/huggingface")
 
-def embed_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
-    """Runs once per Spark partition/task: load the model once, then embed
-    every batch of rows handed to this partition."""
-    import os
-    from sentence_transformers import SentenceTransformer
+# Compute embeddings in batches for memory efficiency
+print("Computing embeddings...")
+batch_size = 32
+all_embeddings = []
 
-    os.environ["HF_HOME"] = "/tmp/.cache/huggingface"
-    os.environ["TRANSFORMERS_CACHE"] = "/tmp/.cache/huggingface"
-    os.environ["HF_HUB_CACHE"] = "/tmp/.cache/huggingface"
-    model = SentenceTransformer(EMBEDDING_MODEL_NAME, cache_folder="/tmp/.cache/huggingface")
+for i in range(0, len(news_df), batch_size):
+    batch = news_df.iloc[i:i+batch_size]
+    vectors = model.encode(batch["embedding_text"].tolist(), show_progress_bar=False)
+    all_embeddings.extend(vectors.tolist())
+    if (i + batch_size) % 128 == 0:
+        print(f"  Processed {min(i + batch_size, len(news_df))}/{len(news_df)} documents")
 
-    for batch in iterator:
-        vectors = model.encode(batch["embedding_text"].tolist(), show_progress_bar=False)
-        yield pd.DataFrame(
-            {
-                "id": batch["id"],
-                "ticker": batch["ticker"],
-                "title": batch["title"],
-                "published_utc": batch["published_utc"].astype(str),
-                "embedding": [v.tolist() for v in vectors],
-            }
-        )
+# Create embeddings DataFrame
+embeddings_df = pd.DataFrame({
+    "id": news_df["id"],
+    "ticker": news_df["ticker"],
+    "title": news_df["title"],
+    "published_utc": news_df["published_utc"].astype(str),
+    "embedding": all_embeddings,
+})
 
-
-embeddings_df = news_df.mapInPandas(embed_partitions, schema=embeddings_schema)
-
-print(f"Computed {embeddings_df.count()} embeddings using {EMBEDDING_MODEL_NAME}")
+print(f"Computed {len(embeddings_df)} embeddings using {EMBEDDING_MODEL_NAME}")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Ensure the pgvector destination table exists
 # MAGIC
-# MAGIC `pgvector` isn't a JDBC-native type, but plain SQL text (`vector(N)`,
-# MAGIC `::vector` casts) works fine over a raw JDBC connection - no psycopg2
-# MAGIC needed.
+# MAGIC The `pgvector` extension must be enabled and the destination table
+# MAGIC created with the correct vector dimension before inserting embeddings.
 
 # COMMAND ----------
 
@@ -495,7 +512,7 @@ print("\nRun sql/02_setup_embeddings_table.sql in your Lakebase database before 
 # MAGIC %md
 # MAGIC ## Upsert embeddings into Lakebase
 # MAGIC
-# MAGIC Written in batches via JDBC's `addBatch`/`executeBatch` for throughput.
+# MAGIC Written in batches via psycopg2's `executemany` for throughput.
 # MAGIC Each embedding is cast to Postgres' `vector` type via `::vector`.
 
 # COMMAND ----------
@@ -503,15 +520,13 @@ print("\nRun sql/02_setup_embeddings_table.sql in your Lakebase database before 
 # DBTITLE 1,Insert embeddings using psycopg2
 import psycopg2
 from psycopg2.extras import execute_values
-from pyspark.sql.functions import current_timestamp, lit
+from datetime import datetime
 
 # Add model_name and embedded_at columns
-embeddings_with_meta = embeddings_df.withColumn("model_name", lit(EMBEDDING_MODEL_NAME)).withColumn(
-    "embedded_at", current_timestamp()
-)
+embeddings_df['model_name'] = EMBEDDING_MODEL_NAME
+embeddings_df['embedded_at'] = datetime.now()
 
-# Collect embeddings to driver for psycopg2 batch insert
-embeddings_rows = embeddings_with_meta.collect()
+embeddings_rows = embeddings_df.to_dict('records')
 
 if len(embeddings_rows) > 0:
     print(f"Inserting {len(embeddings_rows)} embeddings into {EMBEDDINGS_TABLE_NAME}...")
@@ -519,10 +534,10 @@ if len(embeddings_rows) > 0:
     # Build connection from parsed URL
     conn = psycopg2.connect(
         host=db_host,
-        port=parsed.port or 5432,
+        port=db_port,
         dbname=db_name,
-        user=parsed.username,
-        password=parsed.password,
+        user=db_user,
+        password=db_password,
         sslmode='require'
     )
     
@@ -533,13 +548,13 @@ if len(embeddings_rows) > 0:
         # Format embedding as PostgreSQL array literal: '{val1,val2,...}'
         insert_data = [
             (
-                row.id,
-                row.ticker,
-                row.title,
-                str(row.published_utc) if row.published_utc else None,
-                '{' + ','.join(str(float(x)) for x in row.embedding) + '}',
-                row.model_name,
-                row.embedded_at
+                row['id'],
+                row['ticker'],
+                row['title'],
+                str(row['published_utc']) if row['published_utc'] else None,
+                '{' + ','.join(str(float(x)) for x in row['embedding']) + '}',
+                row['model_name'],
+                row['embedded_at']
             )
             for row in embeddings_rows
         ]
@@ -578,125 +593,113 @@ else:
 # MAGIC `article_url` on the publisher's site. This step fetches each URL, uses
 # MAGIC `trafilatura` to extract just the article text (stripping nav/ads/related
 # MAGIC links/etc.), and splits it into overlapping chunks so each chunk can be
-# MAGIC embedded and retrieved independently. Fetching is distributed across the
-# MAGIC cluster via `mapInPandas`; any URL that fails to fetch/extract (paywall,
-# MAGIC timeout, dead link) is skipped rather than failing the whole job.
+# MAGIC embedded and retrieved independently. Any URL that fails to fetch/extract
+# MAGIC (paywall, timeout, dead link) is skipped rather than failing the whole job.
 
 # COMMAND ----------
 
-content_df = news_df.select("id", "ticker", "article_url").filter(
-    "article_url IS NOT NULL AND article_url != ''"
-)
+import pandas as pd
+import requests
+import trafilatura
 
-chunks_schema = StructType(
-    [
-        StructField("article_id", StringType(), False),
-        StructField("ticker", StringType(), False),
-        StructField("chunk_index", StringType(), False),
-        StructField("chunk_text", StringType(), False),
-    ]
-)
+# Filter news_df for articles with URLs
+content_df = news_df[news_df['article_url'].notna() & (news_df['article_url'] != '')].copy()
 
+print(f"Fetching and chunking content from {len(content_df)} article URLs...")
 
-def fetch_and_chunk_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
-    """Runs once per Spark partition/task: fetch each article's HTML, extract
-    the main body text with trafilatura, then split it into overlapping
-    chunks of CHUNK_SIZE characters (CHUNK_OVERLAP characters shared between
-    consecutive chunks so context isn't lost at chunk boundaries)."""
-    import requests
-    import trafilatura
+# Fetch and chunk article content
+out_article_ids, out_tickers, out_chunk_indexes, out_chunk_texts = [], [], [], []
 
-    for batch in iterator:
-        out_article_ids, out_tickers, out_chunk_indexes, out_chunk_texts = [], [], [], []
-        for article_id, ticker, article_url in zip(
-            batch["id"], batch["ticker"], batch["article_url"]
-        ):
-            try:
-                resp = requests.get(article_url, timeout=15)
-                resp.raise_for_status()
-                text = trafilatura.extract(resp.text)
-            except Exception:
-                # Dead link, paywall, timeout, etc. - skip this article's
-                # content chunks rather than failing the whole job.
-                continue
+for idx, row in content_df.iterrows():
+    article_id = row['id']
+    ticker = row['ticker']
+    article_url = row['article_url']
+    
+    try:
+        resp = requests.get(article_url, timeout=15)
+        resp.raise_for_status()
+        text = trafilatura.extract(resp.text)
+    except Exception as e:
+        # Dead link, paywall, timeout, etc. - skip this article's
+        # content chunks rather than failing the whole job.
+        continue
 
-            if not text:
-                continue
+    if not text:
+        continue
 
-            for chunk_index, start in enumerate(range(0, len(text), CHUNK_SIZE - CHUNK_OVERLAP)):
-                chunk_text = text[start : start + CHUNK_SIZE].strip()
-                if not chunk_text:
-                    continue
-                out_article_ids.append(article_id)
-                out_tickers.append(ticker)
-                out_chunk_indexes.append(str(chunk_index))
-                out_chunk_texts.append(chunk_text)
-                if start + CHUNK_SIZE >= len(text):
-                    break
+    # Split into overlapping chunks
+    for chunk_index, start in enumerate(range(0, len(text), CHUNK_SIZE - CHUNK_OVERLAP)):
+        chunk_text = text[start : start + CHUNK_SIZE].strip()
+        if not chunk_text:
+            continue
+        out_article_ids.append(article_id)
+        out_tickers.append(ticker)
+        out_chunk_indexes.append(str(chunk_index))
+        out_chunk_texts.append(chunk_text)
+        if start + CHUNK_SIZE >= len(text):
+            break
+    
+    # Progress update every 10 articles
+    if (idx + 1) % 10 == 0:
+        print(f"  Processed {idx + 1}/{len(content_df)} articles")
 
-        yield pd.DataFrame(
-            {
-                "article_id": out_article_ids,
-                "ticker": out_tickers,
-                "chunk_index": out_chunk_indexes,
-                "chunk_text": out_chunk_texts,
-            }
-        )
+chunks_df = pd.DataFrame({
+    "article_id": out_article_ids,
+    "ticker": out_tickers,
+    "chunk_index": out_chunk_indexes,
+    "chunk_text": out_chunk_texts,
+})
 
-
-chunks_df = content_df.mapInPandas(fetch_and_chunk_partitions, schema=chunks_schema)
-
-print(f"Extracted {chunks_df.count()} content chunks from {content_df.count()} article URLs")
-display(chunks_df.limit(5))
+print(f"Extracted {len(chunks_df)} content chunks from {len(content_df)} article URLs")
+display(chunks_df.head(5))
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Compute chunk embeddings
 # MAGIC
-# MAGIC Same approach as the title/description embeddings above, but one vector
-# MAGIC per content chunk instead of per article.
+# MAGIC Same approach as the title/description embeddings above - load the model
+# MAGIC once and process in batches, but one vector per content chunk instead of
+# MAGIC per article.
 
 # COMMAND ----------
 
-chunk_embeddings_schema = StructType(
-    [
-        StructField("article_id", StringType(), False),
-        StructField("ticker", StringType(), False),
-        StructField("chunk_index", StringType(), False),
-        StructField("chunk_text", StringType(), False),
-        StructField("embedding", ArrayType(FloatType()), False),
-    ]
-)
+import os
+import pandas as pd
+from sentence_transformers import SentenceTransformer
 
+# Model should already be loaded from earlier, but ensure cache is set
+os.environ["HF_HOME"] = "/tmp/.cache/huggingface"
+os.environ["TRANSFORMERS_CACHE"] = "/tmp/.cache/huggingface"
+os.environ["HF_HUB_CACHE"] = "/tmp/.cache/huggingface"
 
-def embed_chunk_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
-    """Runs once per Spark partition: load the model once, then embed
-    every batch of chunks handed to this partition."""
-    import os
-    from sentence_transformers import SentenceTransformer
-
-    os.environ["HF_HOME"] = "/tmp/.cache/huggingface"
-    os.environ["TRANSFORMERS_CACHE"] = "/tmp/.cache/huggingface"
-    os.environ["HF_HUB_CACHE"] = "/tmp/.cache/huggingface"
+print(f"Computing chunk embeddings using {EMBEDDING_MODEL_NAME}...")
+# Reuse the model if already loaded, otherwise load it
+if 'model' not in locals():
+    print("Loading embedding model...")
     model = SentenceTransformer(EMBEDDING_MODEL_NAME, cache_folder="/tmp/.cache/huggingface")
 
-    for batch in iterator:
-        vectors = model.encode(batch["chunk_text"].tolist(), show_progress_bar=False)
-        yield pd.DataFrame(
-            {
-                "article_id": batch["article_id"],
-                "ticker": batch["ticker"],
-                "chunk_index": batch["chunk_index"],
-                "chunk_text": batch["chunk_text"],
-                "embedding": [v.tolist() for v in vectors],
-            }
-        )
+# Compute chunk embeddings in batches
+batch_size = 32
+all_chunk_embeddings = []
 
+for i in range(0, len(chunks_df), batch_size):
+    batch = chunks_df.iloc[i:i+batch_size]
+    vectors = model.encode(batch["chunk_text"].tolist(), show_progress_bar=False)
+    all_chunk_embeddings.extend(vectors.tolist())
+    if (i + batch_size) % 128 == 0:
+        print(f"  Processed {min(i + batch_size, len(chunks_df))}/{len(chunks_df)} chunks")
 
-chunk_embeddings_df = chunks_df.mapInPandas(embed_chunk_partitions, schema=chunk_embeddings_schema)
+# Create chunk embeddings DataFrame
+chunk_embeddings_df = pd.DataFrame({
+    "article_id": chunks_df["article_id"],
+    "ticker": chunks_df["ticker"],
+    "chunk_index": chunks_df["chunk_index"],
+    "chunk_text": chunks_df["chunk_text"],
+    "embedding": all_chunk_embeddings,
+})
 
-print(f"Computed {chunk_embeddings_df.count()} chunk embeddings using {EMBEDDING_MODEL_NAME}")
+print(f"Computed {len(chunk_embeddings_df)} chunk embeddings using {EMBEDDING_MODEL_NAME}")
 
 # COMMAND ----------
 
@@ -721,32 +724,26 @@ print("\nRun sql/03_setup_chunk_embeddings_table.sql in your Lakebase database b
 
 # DBTITLE 1,Insert chunk embeddings using psycopg2
 import psycopg2
-from psycopg2.extras import execute_values
-from pyspark.sql.functions import col, current_timestamp, expr, lit
+from datetime import datetime
 
 # Add id (article_id_chunk_index), model_name, and embedded_at columns
-chunk_embeddings_with_meta = (
-    chunk_embeddings_df.withColumn(
-        "id", expr("concat(article_id, '_', chunk_index)")
-    )
-    .withColumn("model_name", lit(EMBEDDING_MODEL_NAME))
-    .withColumn("embedded_at", current_timestamp())
-    .withColumn("chunk_index", col("chunk_index").cast("int"))
-)
+chunk_embeddings_df['id'] = chunk_embeddings_df['article_id'] + '_' + chunk_embeddings_df['chunk_index']
+chunk_embeddings_df['model_name'] = EMBEDDING_MODEL_NAME
+chunk_embeddings_df['embedded_at'] = datetime.now()
+chunk_embeddings_df['chunk_index'] = chunk_embeddings_df['chunk_index'].astype(int)
 
-# Collect chunk embeddings to driver for psycopg2 batch insert
-chunk_embeddings_rows = chunk_embeddings_with_meta.collect()
+chunk_embeddings_rows = chunk_embeddings_df.to_dict('records')
 
 if len(chunk_embeddings_rows) > 0:
     print(f"Inserting {len(chunk_embeddings_rows)} chunk embeddings into {CHUNK_EMBEDDINGS_TABLE_NAME}...")
     
-    # Build connection from parsed URL
+    # Build connection using psycopg2
     conn = psycopg2.connect(
         host=db_host,
-        port=parsed.port or 5432,
+        port=db_port,
         dbname=db_name,
-        user=parsed.username,
-        password=parsed.password,
+        user=db_user,
+        password=db_password,
         sslmode='require'
     )
     
@@ -757,14 +754,14 @@ if len(chunk_embeddings_rows) > 0:
         # Format embedding as PostgreSQL array literal: '{val1,val2,...}'
         insert_data = [
             (
-                row.id,
-                row.article_id,
-                row.ticker,
-                int(row.chunk_index),
-                row.chunk_text,
-                '{' + ','.join(str(float(x)) for x in row.embedding) + '}',
-                row.model_name,
-                row.embedded_at
+                row['id'],
+                row['article_id'],
+                row['ticker'],
+                int(row['chunk_index']),
+                row['chunk_text'],
+                '{' + ','.join(str(float(x)) for x in row['embedding']) + '}',
+                row['model_name'],
+                row['embedded_at']
             )
             for row in chunk_embeddings_rows
         ]
@@ -773,13 +770,12 @@ if len(chunk_embeddings_rows) > 0:
         insert_sql = f"""
             INSERT INTO {CHUNK_EMBEDDINGS_TABLE_NAME} (
                 id, article_id, ticker, chunk_index, chunk_text, embedding, model_name, embedded_at
-            ) VALUES %s
+            ) VALUES (%s, %s, %s, %s, %s, %s::double precision[], %s, %s)
             ON CONFLICT (id) DO NOTHING
         """
         
-        # execute_values is much faster than individual INSERTs
-        template = "(%s, %s, %s, %s, %s, %s::double precision[], %s, %s)"
-        execute_values(cursor, insert_sql, insert_data, template=template, page_size=100)
+        # executemany in psycopg2 is much faster than individual INSERTs
+        cursor.executemany(insert_sql, insert_data)
         
         conn.commit()
         inserted_count = cursor.rowcount
